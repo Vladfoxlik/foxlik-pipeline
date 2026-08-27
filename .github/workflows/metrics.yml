@@ -1,0 +1,54 @@
+# Замер на 7-й день, гейт репостов и продление токена Instagram.
+#
+# Кладется в репозиторий foxlik-pipeline как .github/workflows/metrics.yml
+#
+# 🔴 У этого задания есть вторая работа, не менее важная первой: **оно не дает
+# GitHub выключить расписание.** Планировщик отключается, если в репозитории
+# 60 дней нет активности, и делает это молча. Поэтому раз в сутки сюда пишется
+# строка в журнал прогонов и коммитится - репозиторий не считается заброшенным.
+#
+# 🔴 Токен Instagram живет 60 дней и продлевается только пока жив. Пропустили -
+# он мертв насовсем, продлить нельзя, только выпускать заново. Отсюда суточный ритм.
+name: metrics
+
+on:
+  schedule:
+    - cron: "17 6 * * *"    # 6:17 UTC, то есть 9:17 по Москве - утренняя сводка
+  workflow_dispatch:
+
+permissions:
+  contents: write           # нужно для коммита в журнал прогонов
+
+concurrency:
+  group: foxlik-metrics
+  cancel-in-progress: false
+
+jobs:
+  metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверки перед работой
+        run: python3 -m tests.test_metrics
+
+      - name: Замер
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
+        run: python3 metrics.py
+
+      - name: Отметка, чтобы GitHub не выключил расписание
+        if: always()        # даже если замер упал - расписание терять нельзя
+        run: |
+          date -u +"%Y-%m-%d %H:%M UTC замер отработал" >> journal/runs.log
+          git config user.name "foxlik-bot"
+          git config user.email "bot@foxlik.local"
+          git add journal/runs.log
+          git diff --staged --quiet || git commit -m "журнал прогонов"
+          git push

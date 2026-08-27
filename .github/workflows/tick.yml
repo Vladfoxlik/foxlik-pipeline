@@ -1,0 +1,60 @@
+# Такт конвейера: приемка и публикация.
+#
+# Кладется в репозиторий foxlik-pipeline как .github/workflows/tick.yml
+#
+# 🔴 Раз в 5 минут - решение владельца 27.08. Причина: при получасовом такте человек
+# нажимает кнопку приемки и полчаса не видит отклика, то есть каждый раз считает,
+# что сломалось. Проверено на живом человеке в тот же день.
+#
+# 🔴 Отсюда следует, что **репозиторий должен быть публичным**. По доке GitHub:
+# «GitHub Actions usage is free ... for public repositories that use standard
+# GitHub-hosted runners». У приватного на бесплатном тарифе 2000 минут в месяц,
+# а пятиминутный такт дает 8640 запусков - не влезает никак.
+#
+# 🔴 Следствие публичности: **логи запусков видны любому.** Поэтому tick.py пишет
+# в лог только номера строк и статусы, без названий роликов и тел ошибок.
+# Подробности уходят владельцу в Telegram и в таблицу. Секреты в код не попадают
+# вообще - они в GitHub Secrets, зашифрованы и в публичном репозитории не читаются.
+name: tick
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:        # кнопка «запустить сейчас» - нужна для первых прогонов
+
+# 🔴 Накладки запрещены. На этом стоит подбор зависших строк в tick.py:
+# строка в статусе ПУБЛИКУЕТСЯ на входе в такт означает упавший прошлый такт,
+# а не соседний работающий. При такте в 5 минут это правило стало важнее:
+# публикация тяжелого ролика может не уложиться в один такт.
+concurrency:
+  group: foxlik-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20     # публикация укладывается в минуты; висеть дольше нечему
+    steps:
+      - uses: actions/checkout@v4
+      # Шага установки Python нет: на ubuntu-latest он предустановлен.
+      # Шага установки зависимостей нет: зависимостей у нас нет.
+
+      - name: Проверки перед работой
+        run: |
+          for m in http google_auth sheets drive telegram instagram vk cloudinary; do
+            python3 -m lib.$m
+          done
+          python3 -m tests.test_tick
+
+      - name: Такт
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          VK_TOKEN: ${{ secrets.VK_TOKEN }}
+          VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
+          CLOUDINARY_URL: ${{ secrets.CLOUDINARY_URL }}
+        run: python3 tick.py
