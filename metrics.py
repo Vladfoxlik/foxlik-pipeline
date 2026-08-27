@@ -38,6 +38,7 @@ import sys
 import traceback
 
 import dictionary
+import generator
 from lib import google_auth, http, instagram, sheets, telegram
 
 SHEET_PUBLICATIONS = "ПУБЛИКАЦИИ"
@@ -230,6 +231,29 @@ class Metrics:
         self.say("словарь обновлен, механик: %d" % len(data))
         if data:
             self.bot.notify(dictionary.summary(data))
+        self.propose_next(data)
+
+    def propose_next(self, data):
+        """Черновик следующей партии, когда предыдущая замерена целиком.
+
+        🔴 Пишется в лист ПЛАН, но ничего не публикует: публикация идет от сдач
+        креаторов, а не от строк плана. То есть черновик безопасен, а утверждает
+        его владелец - как и требует петля §6.
+        """
+        if not self.book or not data:
+            return
+        try:
+            rows, why = generator.maybe_propose(self.book, data, self.today.isoformat())
+            if not rows:
+                self.say("следующая партия не предлагается")
+                return
+            added = generator.write(self.book.sheet("ПЛАН"), rows)
+            self.say("предложена партия: строк %d" % added)
+            self.bot.notify(generator.summary(rows))
+        except Exception as e:
+            self.say("генератор не отработал")
+            self.bot.notify("⚠️ Черновик следующей партии не собрался.\n\n%s"
+                            % http.mask(str(e))[:400])
 
     def report(self, hits, fails):
         """Сводка владельцу. Она и есть смысл всего замера - без нее петля не крутится."""

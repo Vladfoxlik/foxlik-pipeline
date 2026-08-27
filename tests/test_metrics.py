@@ -197,6 +197,42 @@ def selftest():
     assert any("не пересчитался" in line for line in m2.log), m2.log
     assert any("Словарь механик не обновился" in n for n in m2.bot.notes), m2.bot.notes
 
+    # --- вся петля разом: замер -> словарь -> черновик следующей партии ---
+    # 🔴 Без этой проверки последнее звено держится на честном слове: словарь
+    # обновится, а генератор молча не позовется, и заметить это будет нечем.
+    class LoopBook:
+        """Книга, где предыдущая партия замерена целиком - условие генератора."""
+
+        def __init__(self):
+            pub, met, plan = [], [], []
+            for i in range(1, 9):
+                vid = "P1-%02d" % i
+                mech = "папа" if i <= 4 else "вопрос"
+                for pl in ("instagram", "vk"):
+                    pub.append({"ID": vid, "Дата": "2026-09-%02d" % i,
+                                "Площадка": pl, "Механика": mech, "Креатор": "Ксения"})
+                met.append({"ID": vid, "Репосты/1000": 3.0 if i <= 4 else 1.0,
+                            "Подписки": 1})
+                plan.append({"ID": vid, "Креатор": "Ксения" if i % 2 else "Спартак",
+                             "Дата в эфир": "2026-09-%02d" % i})
+            self.sheets = {"ПУБЛИКАЦИИ": FakeSheet(pub), "МЕТРИКИ": FakeSheet(met),
+                           "СЛОВАРЬ": FakeSheet([]), "ПЛАН": FakeSheet(plan)}
+
+        def sheet(self, title):
+            return self.sheets[title]
+
+    lb = LoopBook()
+    m3 = build(pubs=[], measured=[])
+    m3.book = lb
+    m3.run()
+    assert any("словарь обновлен" in line for line in m3.log), m3.log
+    assert any("предложена партия" in line for line in m3.log), m3.log
+    added = [r for r in lb.sheets["ПЛАН"].read() if str(r.get("ID", "")).startswith("P2-")]
+    assert added, "генератор ничего не дописал в ПЛАН"
+    assert all(r["ID"].startswith("P2-") for r in added), added[0]
+    # содержание не выдумано даже здесь, в сквозном прогоне
+    assert all(r["Что в кадре"] == "" and r["Смысл хука"] == "" for r in added)
+
     print("metrics selftest OK: счет гейта, продление токена и тревога, отбор на Д7, "
           "нет повторов, подписки пустые, необязательные метрики не роняют замер, секреты, "
           "отсутствие токена не красит задание, словарь пересчитывается вместе с замером")
