@@ -46,7 +46,7 @@ jobs:
       - name: Отметка, чтобы GitHub не выключил расписание
         if: always()        # даже если замер упал - расписание терять нельзя
         run: |
-          date -u +"%Y-%m-%d %H:%M UTC замер отработал" >> journal/runs.log
+          date -u +"%Y-%m-%d %H:%M UTC запуск состоялся" >> journal/runs.log
           git config user.name "foxlik-bot"
           git config user.email "bot@foxlik.local"
           git add journal/runs.log
