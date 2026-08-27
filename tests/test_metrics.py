@@ -167,9 +167,39 @@ def selftest():
             if v is not None:
                 os.environ[k] = v
 
+    # --- словарь пересчитывается вместе с замером, а не отдельно ---
+    # 🔴 Без этой проверки встройка держится на честном слове: замер прошел бы
+    # зеленым, а память петли молча не обновлялась бы. Заметить это было бы
+    # нечем - в логе замера про словарь ни слова.
+    class FakeBook:
+        def __init__(self):
+            self.asked = []
+
+        def sheet(self, title):
+            self.asked.append(title)
+            return FakeSheet([])
+
+    book = FakeBook()
+    m = build(pubs=[], measured=[])
+    m.book = book
+    m.run()
+    assert "ПУБЛИКАЦИИ" in book.asked and "МЕТРИКИ" in book.asked and "СЛОВАРЬ" in book.asked,         "пересчет словаря не тронул нужные листы: %s" % book.asked
+    assert any("словарь" in line for line in m.log), m.log
+
+    # падение словаря не роняет замер: его результат уже в таблице
+    class BrokenBook:
+        def sheet(self, title):
+            raise RuntimeError("лист недоступен")
+
+    m2 = build(pubs=[], measured=[])
+    m2.book = BrokenBook()
+    m2.run()
+    assert any("не пересчитался" in line for line in m2.log), m2.log
+    assert any("Словарь механик не обновился" in n for n in m2.bot.notes), m2.bot.notes
+
     print("metrics selftest OK: счет гейта, продление токена и тревога, отбор на Д7, "
           "нет повторов, подписки пустые, необязательные метрики не роняют замер, секреты, "
-          "отсутствие токена не красит задание")
+          "отсутствие токена не красит задание, словарь пересчитывается вместе с замером")
 
 
 if __name__ == "__main__":

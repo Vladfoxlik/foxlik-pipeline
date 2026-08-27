@@ -37,6 +37,7 @@ import os
 import sys
 import traceback
 
+import dictionary
 from lib import google_auth, http, instagram, sheets, telegram
 
 SHEET_PUBLICATIONS = "ПУБЛИКАЦИИ"
@@ -84,12 +85,14 @@ def verdict(rate):
 
 
 class Metrics:
-    def __init__(self, ig, pubs, metrics_sheet, settings, bot, today=None):
+    def __init__(self, ig, pubs, metrics_sheet, settings, bot, today=None, book=None):
         self.ig = ig
         self.pubs = pubs
         self.metrics = metrics_sheet
         self.settings = settings
         self.bot = bot
+        # книга целиком нужна только для пересчета словаря; в проверках ее нет
+        self.book = book
         self.today = today or datetime.date.today()
         self.log = []
 
@@ -185,6 +188,7 @@ class Metrics:
         rows = self.due()
         if not rows:
             self.say("замерять нечего")
+            self.refresh_dictionary()
             return self.log
 
         hits, fails = [], []
@@ -200,7 +204,32 @@ class Metrics:
             (hits if (rate or 0) >= GATE else fails).append((row.get(COL_ID, ""), rate))
 
         self.report(hits, fails)
+        self.refresh_dictionary()
         return self.log
+
+    def refresh_dictionary(self):
+        """Пересчет словаря механик - памяти петли.
+
+        🔴 Стоит здесь, а не отдельным заданием, по одной причине: словарь обязан
+        меняться ровно тогда, когда появились новые замеры. Отдельное расписание
+        разъехалось бы с этим моментом, и словарь молча отставал бы на цикл.
+
+        Пересчет идемпотентен: считает заново из ПУБЛИКАЦИЙ и МЕТРИК, дублей
+        не плодит, колонки решений владельца не трогает.
+        """
+        if not self.book:
+            return                       # в проверках книги нет, и это нормально
+        try:
+            data = dictionary.rebuild(self.book)
+        except Exception as e:
+            # словарь важен, но замер важнее: его результат уже в таблице
+            self.say("словарь не пересчитался")
+            self.bot.notify("⚠️ Словарь механик не обновился.\n\n%s"
+                            % http.mask(str(e))[:400])
+            return
+        self.say("словарь обновлен, механик: %d" % len(data))
+        if data:
+            self.bot.notify(dictionary.summary(data))
 
     def report(self, hits, fails):
         """Сводка владельцу. Она и есть смысл всего замера - без нее петля не крутится."""
@@ -253,7 +282,8 @@ def from_env():
                    metrics_sheet=sheets.Sheet(sa, sid, SHEET_METRICS),
                    settings=settings,
                    bot=telegram.Bot(os.environ["TELEGRAM_BOT_TOKEN"],
-                                    os.environ["TELEGRAM_OWNER_ID"]))
+                                    os.environ["TELEGRAM_OWNER_ID"]),
+                   book=sheets.Book(sa, sid))
 
 
 def main():

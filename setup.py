@@ -243,6 +243,15 @@ def selftest():
     import metrics
     assert metrics.COL_MEDIA in LAYOUT["ПУБЛИКАЦИИ"]
     assert "Подписки" in LAYOUT["МЕТРИКИ"] and "Вердикт" in LAYOUT["МЕТРИКИ"]
+    # 🔴 словарь пишет в лист по именам колонок - промах вылезет только в бою
+    import dictionary
+    for name in (dictionary.COL_MECHANIC, dictionary.COL_COUNT, dictionary.COL_MEDIAN,
+                 dictionary.COL_SUBS, dictionary.COL_METRIC_STATUS, dictionary.COL_VIDEOS):
+        assert name in LAYOUT["СЛОВАРЬ"], "dictionary ждет колонку %s" % name
+    # и колонки человека обязаны существовать: иначе решать будет негде
+    for name in dictionary.HUMAN_COLUMNS:
+        assert name in LAYOUT["СЛОВАРЬ"], name
+    assert "Механика" in LAYOUT["ПУБЛИКАЦИИ"], "без нее словарь не на чем строить"
     print("setup selftest OK: разбор плана, варианты для формы, чужая колонка отвергнута, "
           "заголовки один раз, дописывание справа, колонки сходятся с tick и metrics")
 
