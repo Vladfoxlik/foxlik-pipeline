@@ -115,14 +115,16 @@ def selftest():
     # взяли живой пример, чтобы проверка была «как в бою», и чуть не отправили его
     # в публичный репозиторий вместе с историей. Проверке все равно, какие цифры,
     # а цена ошибки - чужой доступ к боту приемки.
-    tg = "https://api.telegram.org/bot1234567890:AAFakeFakeFakeFakeFakeFakeFakeFakeFak/sendMessage"
+    # Короткий он тоже намеренно: длинная подделка формой совпадает с настоящим
+    # токеном, и поиск секретов перед публикацией спотыкался бы о нее каждый раз.
+    tg = "https://api.telegram.org/bot1234567890:FAKE/sendMessage"
     assert mask(tg) == "https://api.telegram.org/bot<ТОКЕН>/sendMessage", mask(tg)
     assert mask("https://graph.instagram.com/x?fields=id&access_token=EAAG123abc") \
         == "https://graph.instagram.com/x?fields=id&access_token=<СКРЫТО>"
     assert mask("api.vk.com/method/video.save?access_token=vk1.a.SECRET&v=5.199") \
         == "api.vk.com/method/video.save?access_token=<СКРЫТО>&v=5.199"
     err = HttpError(400, '{"error":"bad"}', tg)
-    assert "AAFakeFake" not in str(err), "токен обязан исчезнуть из текста ошибки"
+    assert "FAKE" not in str(err), "токен обязан исчезнуть из текста ошибки"
     # разбор ответа: JSON разбирается, произвольный текст остается текстом
     assert _maybe_json('{"ok": true}') == {"ok": True}
     assert _maybe_json("не json") == "не json"
