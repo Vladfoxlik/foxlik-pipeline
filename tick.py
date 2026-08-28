@@ -35,6 +35,7 @@ from lib import cloudinary, drive, google_auth, http, instagram, sheets, telegra
 
 SHEET_SUBMISSIONS = "СДАЧИ"
 SHEET_PUBLICATIONS = "ПУБЛИКАЦИИ"
+SHEET_PLAN = "ПЛАН"
 
 # Колонки листа СДАЧИ. Имена обязаны совпадать с заголовками в таблице:
 # промах ловится вслух в sheets.column_letter, а не молча.
@@ -67,7 +68,7 @@ MAX_MB = 300            # предохранитель: больше в памя
 
 class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
-                 today=None):
+                 today=None, plan=None):
         self.bot = bot
         self.sheet = sheet
         self.pubs = pubs
@@ -75,8 +76,54 @@ class Pipeline:
         self.ig = ig
         self.vk = vkontakte
         self.cloud = cloud
+        self.plan = plan
         self.today = today or datetime.date.today()
         self.log = []
+        self._mechanics = None      # лист ПЛАН читается один раз на такт
+
+    # ---------- механика ролика ----------
+
+    def mechanic_of(self, plan_id):
+        """Механика строки плана. Без нее ролик выпадает из памяти петли.
+
+        🔴 Это место 28.08 оказалось разрывом всей петли. Словарь механик берет
+        механику ТОЛЬКО из листа ПУБЛИКАЦИИ и строки с пустой механикой пропускает,
+        а такт ее не писал вовсе - при снятых замерах система докладывала бы
+        «считать нечего» и указывала бы неверную причину.
+
+        Источник истины - лист ПЛАН: там механику задает человек при сборке партии.
+        Такт ее только переносит и никогда не придумывает.
+
+        Пропажу озвучиваем вслух: молча оставленная пустота выглядит как успех,
+        а стоит одного ролика в замере.
+        """
+        plan_id = (plan_id or "").strip()
+        if self._mechanics is None:
+            self._mechanics = {}
+            if self.plan is not None:
+                try:
+                    for row in self.plan.read():
+                        key = (row.get("ID") or "").strip()
+                        if key:
+                            self._mechanics[key] = (row.get("Механика") or "").strip()
+                except Exception as e:
+                    self.warn_mechanic("лист ПЛАН не прочитался: %s"
+                                       % http.mask(str(e))[:200])
+            else:
+                self.warn_mechanic("такту не передан лист ПЛАН")
+        return self._mechanics.get(plan_id, "")
+
+    def warn_mechanic(self, why):
+        """Пропажа механики обязана быть слышной, но лог публичный.
+
+        Поэтому в лог идет только факт («механика не определена»), а причина
+        с номером строки - владельцу в Telegram. Промах поймала проверка 19:
+        первая версия писала номер строки плана в лог, а он содержит название ролика.
+        """
+        self.say("механика не определена")
+        self.bot.notify("⚠️ Ролик уйдет в учет без механики: %s\n\n"
+                        "Словарь такие строки пропускает - этот ролик не попадет "
+                        "в замер механик. Проверьте лист ПЛАН." % why)
 
     def say(self, line):
         """Единственная точка вывода - и единственное место, где чистятся секреты.
@@ -199,15 +246,23 @@ class Pipeline:
         if self.vk:
             links["vk"] = self.vk.publish(name, content, name=caption, message=caption)
 
+        plan_id = row.get(COL_PLAN, "")
+        mechanic = self.mechanic_of(plan_id)
+        if not mechanic:
+            self.warn_mechanic("строка %s не найдена в листе ПЛАН или механика "
+                               "в ней пуста" % (plan_id or "без номера"))
         for platform, link in links.items():
-            self.pubs.append({"ID": row.get(COL_PLAN, ""),
+            self.pubs.append({"ID": plan_id,
                               "Дата": self.today.isoformat(),
                               "Площадка": platform,
                               "Ссылка": link,
                               # 🔴 без него metrics.py не сможет снять замер на Д7:
                               # insights запрашиваются по идентификатору медиа, не по ссылке
                               "Медиа ID": media_ids.get(platform, ""),
-                              "Креатор": row.get(COL_EMAIL, "")})
+                              "Креатор": row.get(COL_EMAIL, ""),
+                              # 🔴 без нее словарь механик пропустит этот ролик,
+                              # и партия не попадет в память петли
+                              "Механика": mechanic})
         self.sheet.set(row["_row"], COL_STATUS, PUBLISHED)
         self.say("строка %s опубликована: %s" % (row["_row"], ", ".join(links) or "никуда"))
         self.bot.notify("📤 Опубликовано: %s\n%s" % (
@@ -281,6 +336,9 @@ def from_env():
         bot=telegram.Bot(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_OWNER_ID"]),
         sheet=sheets.Sheet(sa, sid, SHEET_SUBMISSIONS),
         pubs=sheets.Sheet(sa, sid, SHEET_PUBLICATIONS),
+        # 🔴 Лист ПЛАН нужен ради одной колонки - «Механика». Без него ролик
+        # уходит в учет обезличенным и выпадает из памяти петли.
+        plan=sheets.Sheet(sa, sid, SHEET_PLAN),
         disk=drive.Drive(sa), ig=ig, vkontakte=vkontakte, cloud=cloud)
 
 

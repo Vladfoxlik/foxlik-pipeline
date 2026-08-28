@@ -124,11 +124,13 @@ def row(status="", plan="P26-03 · папа собирает столик", date
             T.COL_REASON: ""}
 
 
-def build(rows, presses=(), ig=None, disk=None, today=TODAY):
+def build(rows, presses=(), ig=None, disk=None, today=TODAY, plan=False):
     sheet = FakeSheet(rows)
+    if plan is False:                      # по умолчанию план с одной знакомой строкой
+        plan = FakeSheet([{"ID": "P26-09", "Механика": "папа"}])
     pipe = T.Pipeline(bot=FakeBot(presses), sheet=sheet, pubs=FakeSheet([]),
                       disk=disk or FakeDrive(), ig=ig if ig is not None else FakeIG(),
-                      vkontakte=FakeVK(), cloud=FakeCloud(), today=today)
+                      vkontakte=FakeVK(), cloud=FakeCloud(), today=today, plan=plan)
     return pipe, sheet
 
 
@@ -313,9 +315,57 @@ def selftest():
     assert pipe.pubs.rows, "ничего не опубликовалось"
     assert all(x["Креатор"] == "ksenia@gmail.com" for x in pipe.pubs.rows),         pipe.pubs.rows
 
-    print("tick selftest OK: 21 проверка - полный путь, одна публикация за такт, "
+    # --- 21. механика ролика доезжает до ПУБЛИКАЦИЙ ---
+    # 🔴 Приемка 28.08 нашла здесь разрыв всей петли: словарь берет механику
+    # ТОЛЬКО из листа ПУБЛИКАЦИИ (dictionary.py) и строки с пустой механикой
+    # пропускает, а такт ее не писал вовсе. Итог: после партии система докладывает
+    # «замеров нет» ПРИ снятых замерах и называет неверную причину - владелец идет
+    # чинить метрики, а сломана разметка. Механику берем из строки ПЛАНА по ее ID.
+    plan = FakeSheet([{"ID": "P26-09", "Механика": "папа", "Креатор": "Спартак"}])
+    pipe, sheet = build([dict(row(status=T.APPROVED, date="2026-09-01",
+                                  plan="P26-09"),
+                              **{T.COL_EMAIL: "ksenia@gmail.com"})], plan=plan)
+    pipe.run()
+    assert pipe.pubs.rows, "ничего не опубликовалось"
+    assert all(x.get("Механика") == "папа" for x in pipe.pubs.rows), pipe.pubs.rows
+
+    # --- 22. механика не нашлась - владельца предупреждают, а не молчат ---
+    # Пустая механика тихо выбрасывает ролик из памяти петли. Отказ обязан быть
+    # слышным: это ровно тот класс, где тишина выглядит как успех.
+    plan = FakeSheet([{"ID": "P26-01", "Механика": "папа"}])
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01", plan="P26-09")],
+                        plan=plan)
+    pipe.run()
+    assert pipe.pubs.rows and pipe.pubs.rows[0].get("Механика") == ""
+    assert any("механик" in n.lower() for n in pipe.bot.notes), (
+        "механика не нашлась, а владельцу не сказали: %s" % pipe.bot.notes)
+
+    # --- 23. листа ПЛАН нет вовсе - тоже предупреждение, а не тихая пустота ---
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01", plan="P26-09")],
+                        plan=None)
+    pipe.run()
+    assert any("механик" in n.lower() for n in pipe.bot.notes), pipe.bot.notes
+
+    # --- 24. план читается один раз на такт, а не на каждую площадку ---
+    # Лист ПЛАН - сетевой запрос. Публикация идет на две площадки, и если читать
+    # его в цикле, такт удвоит обращения на ровном месте.
+    plan = FakeSheet([{"ID": "P26-09", "Механика": "папа"}])
+    plan.reads = 0
+    origin = plan.read
+
+    def counted():
+        plan.reads += 1
+        return origin()
+    plan.read = counted
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01", plan="P26-09")],
+                        plan=plan)
+    pipe.run()
+    assert plan.reads <= 1, "лист ПЛАН прочитан %d раз за такт" % plan.reads
+
+    print("tick selftest OK: 24 проверки - полный путь, одна публикация за такт, "
           "идемпотентность, зависшее, сдвиг листа, ошибки, секреты, перевалка, "
-          "публичный лог не выдает содержание, имена колонок сняты с живой формы")
+          "публичный лог не выдает содержание, имена колонок сняты с живой формы, "
+          "механика доезжает до учета и ее пропажа слышна")
 
 
 if __name__ == "__main__":
