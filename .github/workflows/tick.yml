@@ -93,6 +93,10 @@ jobs:
           VK_TOKEN: ${{ secrets.VK_TOKEN }}
           VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
           CLOUDINARY_URL: ${{ secrets.CLOUDINARY_URL }}
+          # 🔴 Чем публикуем с 31.08 (решение владельца 29.08). Пока этих двух строк
+          # тут нет, такт в облаке работает вхолостую: приемка идет, эфира нет.
+          POSTMYPOST_TOKEN: ${{ secrets.POSTMYPOST_TOKEN }}
+          POSTMYPOST_PROJECT_ID: ${{ secrets.POSTMYPOST_PROJECT_ID }}
         run: |
           for i in $(seq 1 11); do
             echo "--- такт $i из 11 ---"

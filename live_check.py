@@ -142,14 +142,41 @@ def doctor():
                          headers=sa.headers(drive.SCOPES))
         return "папка «%s» открыта роботу" % (r or {}).get("name")
 
+    def pmp():
+        """🔴 Чем публикуем с 31.08. Проверяется доступом, а не наличием токена:
+
+        замер того дня показал, что оплаченного тарифа мало - API открывается
+        отдельным модулем в биллинге, и до его включения все запросы к проекту
+        отвечают 400 «Ваш тариф не поддерживает API».
+        """
+        from lib import postmypost
+        token = env.get("POSTMYPOST_TOKEN") or os.environ.get("POSTMYPOST_TOKEN")
+        if not token:
+            raise RuntimeError("нет POSTMYPOST_TOKEN")
+        pid = env.get("POSTMYPOST_PROJECT_ID") or os.environ.get(
+            "POSTMYPOST_PROJECT_ID", 358244)
+        accounts = postmypost.Postmypost(token, pid).accounts()
+        живые = [a for a in accounts if a.get("connection_status") == 1]
+        return "аккаунтов подключено: %s (%s)" % (
+            len(живые), ", ".join(a.get("name", "?") for a in живые) or "нет")
+
     check("Google", google, "шаг 1: ключ в корень проекта, таблицу расшарить на робота")
     check("Папка сдач", uploads,
           "расшарить папку «... (File responses)» на почту робота, права Читатель")
     check("Бот", tg, "TELEGRAM_BOT_TOKEN в .env")
     check("Группа", group, "TELEGRAM_GROUP_ID в .env")
-    check("Instagram", ig, "шаг 5: developers.facebook.com, токен в .env")
+    check("Postmypost", pmp,
+          "POSTMYPOST_TOKEN в .env, модуль «API» включен в app.postmypost.io/billing")
     check("Cloudinary", cloud, "шаг 4: cloudinary.com, CLOUDINARY_URL в .env")
-    check("ВКонтакте", vkontakte, "шаг 6: Standalone-приложение, право video")
+
+    # 🔴 Instagram и ВК своими токенами отменены решением владельца 29.08: публикует
+    # Postmypost. Доктор требовал их до 31.08 и печатал два ложных «не хватает» -
+    # человек читал их как незакрытые шаги настройки (А39). Проверки остаются
+    # выключенными, а не удаленными: запасной путь на случай отказа сервиса.
+    if env.get("IG_TOKEN"):
+        check("Instagram", ig, "запасной путь, основной - Postmypost")
+    if env.get("VK_TOKEN"):
+        check("ВКонтакте", vkontakte, "запасной путь, основной - Postmypost")
 
     print("✅ ГОТОВО (%s):" % len(ok))
     for line in ok:

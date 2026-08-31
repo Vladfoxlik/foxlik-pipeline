@@ -17,8 +17,9 @@ TODAY = datetime.date(2026, 9, 4)
 
 
 class FakeSheet:
-    def __init__(self, rows):
+    def __init__(self, rows, header=None):
         self.rows = rows                 # список словарей без _row
+        self.header = header             # None - лист без схемы (ПЛАН в проверках)
         self.writes = []
 
     def read(self):
@@ -38,6 +39,13 @@ class FakeSheet:
             self.set(row, column, value)
 
     def append(self, values):
+        # 🔴 Настоящий лист берет ТОЛЬКО колонки из своего заголовка
+        # (lib/sheets.Sheet.append: row = [values.get(n) for n in header]).
+        # Пока заглушка складывала весь словарь, проверки проходили на значении,
+        # которого в живой таблице не появилось бы: колонки «Соответствие» в листе
+        # ПУБЛИКАЦИИ нет, и отметка об отступлении пропала бы молча. Найдено 30.08.
+        if self.header is not None:
+            values = dict((n, values.get(n, "")) for n in self.header)
         self.rows.append(dict(values))
         self.writes.append(("append", values))
 
@@ -117,20 +125,58 @@ class FakeVK:
         return "https://vk.com/wall-777_1"
 
 
-def row(status="", plan="P26-03 · папа собирает столик", date="", file_="link1",
+class FakePmp:
+    """Подставной Postmypost. Подписи повторяют lib/postmypost.Postmypost."""
+
+    def __init__(self, fail=None):
+        self.fail = fail
+        self.posted = []          # (имя файла, подпись, аккаунты, время)
+
+    def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at):
+        if self.fail:
+            raise self.fail
+        self.posted.append((filename, content, list(account_ids), post_at))
+        return 31879606           # id публикации в сервисе, снят живым прогоном 31.08
+
+
+# Аккаунты сняты живьем 31.08. 🔴 Поле называется `chanel_id` - с одной «n»:
+# так в их API, и справочник наш это писал иначе. Промах был бы молчаливым.
+PMP_ACCOUNTS = [{"id": 2248535, "chanel_id": 2, "name": "FOXLIK"},
+                {"id": 2248551, "chanel_id": 1, "name": "myplayroom_shop"}]
+
+
+def row(status="", plan="P26-09 · папа собирает столик", date="", file_="link1",
         time_="2026-09-03 14:22", comment=""):
     return {T.COL_TIME: time_, T.COL_PLAN: plan, T.COL_FILE: file_,
             T.COL_COMMENT: comment, T.COL_STATUS: status, T.COL_DATE: date,
             T.COL_REASON: ""}
 
 
-def build(rows, presses=(), ig=None, disk=None, today=TODAY, plan=False):
+def build(rows, presses=(), ig=None, disk=None, today=TODAY, plan=False,
+          pmp=None, accounts=()):
     sheet = FakeSheet(rows)
-    if plan is False:                      # по умолчанию план с одной знакомой строкой
-        plan = FakeSheet([{"ID": "P26-09", "Механика": "папа"}])
-    pipe = T.Pipeline(bot=FakeBot(presses), sheet=sheet, pubs=FakeSheet([]),
+    if plan is False:
+        # 🔴 С 31.08 такт берет подпись к посту из листа ПЛАН и без нее публикацию
+        # откладывает. Поэтому умолчание собирается из ТЕХ ЖЕ строк, что и сдачи:
+        # в жизни план всегда есть и всегда согласован, а тест без него проверял бы
+        # отказ вместо публикации и молча ослаб бы.
+        ids = []
+        for r in rows:
+            key = T.Pipeline.plan_key(r.get(T.COL_PLAN))
+            if key and key not in ids:
+                ids.append(key)
+        plan = FakeSheet([{"ID": x, "Механика": "папа",
+                           "Описание к посту": "текст поста"} for x in ids]
+                         or [{"ID": "P26-09", "Механика": "папа",
+                              "Описание к посту": "текст поста"}])
+    # 🔴 Лист ПУБЛИКАЦИИ берется со схемой из setup.LAYOUT, а не пустым: он и
+    # в жизни создан по ней, и колонка, которой там нет, молча пропадает.
+    import setup as S
+    pipe = T.Pipeline(bot=FakeBot(presses), sheet=sheet,
+                      pubs=FakeSheet([], header=list(S.LAYOUT["ПУБЛИКАЦИИ"])),
                       disk=disk or FakeDrive(), ig=ig if ig is not None else FakeIG(),
-                      vkontakte=FakeVK(), cloud=FakeCloud(), today=today, plan=plan)
+                      vkontakte=FakeVK(), cloud=FakeCloud(), today=today, plan=plan,
+                      pmp=pmp, pmp_accounts=accounts)
     return pipe, sheet
 
 
@@ -145,7 +191,7 @@ def selftest():
     pipe.run()
     assert len(pipe.bot.cards) == 1, "новая сдача обязана уйти владельцу"
     assert sheet.rows[0][T.COL_STATUS] == T.ON_REVIEW
-    assert pipe.bot.cards[0]["title"].startswith("P26-03")
+    assert pipe.bot.cards[0]["title"].startswith("P26-09")
 
     # --- 2. пустая строка формы не тревожит владельца ---
     pipe, sheet = build([row(file_="")])
@@ -174,9 +220,12 @@ def selftest():
     assert pipe.bot.confirmed == 1
 
     # --- 6. 🔴 одна публикация за такт, даже если созрело три ---
+    трое = FakeSheet([{"ID": x, "Механика": "папа", "Описание к посту": "текст " + x}
+                      for x in ("A", "B", "C")])
     pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01", plan="A"),
                          row(status=T.APPROVED, date="2026-09-02", plan="B"),
-                         row(status=T.APPROVED, date="2026-09-03", plan="C")])
+                         row(status=T.APPROVED, date="2026-09-03", plan="C")],
+                        plan=трое)
     pipe.run()
     published = [x[T.COL_STATUS] for x in sheet.rows]
     assert published == [T.PUBLISHED, T.APPROVED, T.APPROVED], published
@@ -185,10 +234,10 @@ def selftest():
     # --- 7. 🔴 второй такт не публикует то же самое повторно ---
     pipe2 = T.Pipeline(bot=FakeBot(), sheet=sheet, pubs=FakeSheet([]),
                        disk=FakeDrive(), ig=FakeIG(), vkontakte=FakeVK(),
-                       cloud=FakeCloud(), today=TODAY)
+                       cloud=FakeCloud(), today=TODAY, plan=трое)
     pipe2.run()
     assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED
-    assert len(pipe2.ig.posted) == 1 and pipe2.ig.posted[0][1] == "B", \
+    assert len(pipe2.ig.posted) == 1 and pipe2.ig.posted[0][1] == "текст B", \
         "второй такт обязан взять следующую, а не ту же"
 
     # --- 8. дата в будущем ждет своего дня ---
@@ -244,6 +293,8 @@ def selftest():
     # --- 19. 🔴 репозиторий публичный: в лог не идут ни тексты ошибок, ни названия роликов ---
     pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01",
                              plan="P1-04 · папа рисует кашу на световом столе")],
+                        plan=FakeSheet([{"ID": "P1-04", "Механика": "папа",
+                                         "Описание к посту": "текст поста"}]),
                         disk=FakeDrive(fail="Диск вернул 403 для файла отчет_клиента.mp4"))
     log = " ".join(pipe.run())
     assert "403" not in log and "отчет_клиента" not in log, "тело ошибки не должно идти в лог"
@@ -255,7 +306,9 @@ def selftest():
 
     # успешная публикация тоже не называет ролик в логе
     pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01",
-                             plan="P1-09 · вопрос про сад")])
+                             plan="P1-09 · вопрос про сад")],
+                        plan=FakeSheet([{"ID": "P1-09", "Механика": "папа",
+                                         "Описание к посту": "текст поста"}]))
     log = " ".join(pipe.run())
     assert "вопрос про сад" not in log, "название ролика не должно идти в лог"
     assert "опубликована" in log
@@ -300,9 +353,14 @@ def selftest():
     # креатор в ПУБЛИКАЦИЯХ остался бы пустым, и вопрос «у кого лучше заходит»
     # снова остался бы без ответа. Список ниже - дословный, не переписывать
     # по памяти: он верен ровно настолько, насколько снят с живой формы.
+    # Дополнено 30.08: добавлен вопрос об отступлениях, заголовки листа СДАЧИ
+    # перечитаны сервисным аккаунтом. Google вставил колонку ШЕСТОЙ - перед
+    # нашими служебными, поэтому чтение по позиции сломалось бы молча.
     FORM_HEADER = ["Отметка времени", "Адрес электронной почты",
-                   "Строка плана", "Файл", "Комментарий"]
-    for name in (T.COL_TIME, T.COL_EMAIL, T.COL_PLAN, T.COL_FILE, T.COL_COMMENT):
+                   "Строка плана", "Файл", "Комментарий",
+                   "Сняли по сцене из задания?"]
+    for name in (T.COL_TIME, T.COL_EMAIL, T.COL_PLAN, T.COL_FILE, T.COL_COMMENT,
+                 T.COL_MATCH):
         assert name in FORM_HEADER, (
             "код ждет колонку %r, а форма создала %s" % (name, FORM_HEADER))
 
@@ -321,7 +379,8 @@ def selftest():
     # пропускает, а такт ее не писал вовсе. Итог: после партии система докладывает
     # «замеров нет» ПРИ снятых замерах и называет неверную причину - владелец идет
     # чинить метрики, а сломана разметка. Механику берем из строки ПЛАНА по ее ID.
-    plan = FakeSheet([{"ID": "P26-09", "Механика": "папа", "Креатор": "Спартак"}])
+    plan = FakeSheet([{"ID": "P26-09", "Механика": "папа", "Креатор": "Спартак",
+                       "Описание к посту": "текст поста"}])
     pipe, sheet = build([dict(row(status=T.APPROVED, date="2026-09-01",
                                   plan="P26-09"),
                               **{T.COL_EMAIL: "ksenia@gmail.com"})], plan=plan)
@@ -329,16 +388,39 @@ def selftest():
     assert pipe.pubs.rows, "ничего не опубликовалось"
     assert all(x.get("Механика") == "папа" for x in pipe.pubs.rows), pipe.pubs.rows
 
-    # --- 22. механика не нашлась - владельца предупреждают, а не молчат ---
-    # Пустая механика тихо выбрасывает ролик из памяти петли. Отказ обязан быть
-    # слышным: это ровно тот класс, где тишина выглядит как успех.
-    plan = FakeSheet([{"ID": "P26-01", "Механика": "папа"}])
+    # --- 21б. 🔴 в ПУБЛИКАЦИИ едет не одна ось, а все пять (Ш2, 29.08) ---
+    # Механику переносили с 28.08, а тему, товар, ценность и тип хука - нет.
+    # Значит четыре новые колонки плана оставались текстом в таблице, которого
+    # петля не видит: словарь умеет считать по любой оси, но данных по ним
+    # в ПУБЛИКАЦИЯХ не появлялось.
+    plan = FakeSheet([{"ID": "P26-09", "Механика": "папа", "Креатор": "Спартак",
+                       "Тема": "А1 гаджет-вина", "Товар": "световой планшет",
+                       "Ценность": "анти-гаджет", "Тип хука": "вопрос",
+                       "Описание к посту": "текст поста"}])
+    pipe, sheet = build([dict(row(status=T.APPROVED, date="2026-09-01",
+                                  plan="P26-09"),
+                              **{T.COL_EMAIL: "ksenia@gmail.com"})], plan=plan)
+    pipe.run()
+    assert pipe.pubs.rows, "ничего не опубликовалось"
+    for оси in pipe.pubs.rows:
+        assert оси.get("Тема") == "А1 гаджет-вина", оси
+        assert оси.get("Товар") == "световой планшет", оси
+        assert оси.get("Ценность") == "анти-гаджет", оси
+        assert оси.get("Тип хука") == "вопрос", оси
+
+    # --- 22. 🔴 строки нет в ПЛАНЕ - публикации не будет, и это слышно (31.08) ---
+    # До 31.08 такт предупреждал про механику и публиковал: считалось, что дыра
+    # в замере дешевле задержки. С появлением подписи из ПЛАНА цена изменилась:
+    # у строки, которой нет в плане, нет и текста поста, и ролик ушел бы в эфир
+    # с идентификатором «P26-09» в подписи. Публиковать такое хуже, чем ждать.
+    plan = FakeSheet([{"ID": "P26-01", "Механика": "папа", "Описание к посту": "текст поста"}])
     pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01", plan="P26-09")],
                         plan=plan)
     pipe.run()
-    assert pipe.pubs.rows and pipe.pubs.rows[0].get("Механика") == ""
-    assert any("механик" in n.lower() for n in pipe.bot.notes), (
-        "механика не нашлась, а владельцу не сказали: %s" % pipe.bot.notes)
+    assert not pipe.pubs.rows, "строки нет в плане, а ролик ушел в эфир"
+    assert sheet.rows[0][T.COL_STATUS] == T.APPROVED, sheet.rows[0][T.COL_STATUS]
+    сказано = " ".join(pipe.bot.notes) + " ".join(str(x) for x in pipe.log)
+    assert "описан" in сказано.lower(), ("про пропажу описания надо сказать: %s" % сказано)
 
     # --- 23. листа ПЛАН нет вовсе - тоже предупреждение, а не тихая пустота ---
     pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01", plan="P26-09")],
@@ -349,7 +431,7 @@ def selftest():
     # --- 24. план читается один раз на такт, а не на каждую площадку ---
     # Лист ПЛАН - сетевой запрос. Публикация идет на две площадки, и если читать
     # его в цикле, такт удвоит обращения на ровном месте.
-    plan = FakeSheet([{"ID": "P26-09", "Механика": "папа"}])
+    plan = FakeSheet([{"ID": "P26-09", "Механика": "папа", "Описание к посту": "текст поста"}])
     plan.reads = 0
     origin = plan.read
 
@@ -362,10 +444,141 @@ def selftest():
     pipe.run()
     assert plan.reads <= 1, "лист ПЛАН прочитан %d раз за такт" % plan.reads
 
-    print("tick selftest OK: 24 проверки - полный путь, одна публикация за такт, "
+    # --- 25. 🔴 креатор снял по сцене - оси едут в учет подтвержденными ---
+    # Разрыв А9 (29.08): оси переносятся из ПЛАНА в ПУБЛИКАЦИИ автоматически,
+    # то есть учет описывает **замысел**, а не то, что попало в кадр. Если
+    # креатор снял иначе, а места сказать об этом нет, словарь через месяц
+    # научится приему, которого не было, и ошибка не подаст ни одного признака.
+    # В подставе - **ответ формы дословно**, а не канон из кода: канон подложить
+    # легко, и тогда проверка не тронет разбор ответа вовсе.
+    ОТВЕТ_ДА = "Да, снял по сцене"
+    ОТВЕТ_НЕТ = "Нет, отступил - опишу в комментарии"
+    plan = FakeSheet([{"ID": "P1-01", "Механика": "папа", "Ценность": "занят сам", "Описание к посту": "текст поста"}])
+    pipe, sheet = build([dict(row(status=T.APPROVED, date="2026-09-01", plan="P1-01"),
+                              **{T.COL_MATCH: ОТВЕТ_ДА})], plan=plan)
+    pipe.run()
+    assert pipe.pubs.rows, "ничего не опубликовалось"
+    assert all(x.get("Соответствие") == T.MATCH_OK for x in pipe.pubs.rows), pipe.pubs.rows
+    assert all(x.get("Ценность") == "занят сам" for x in pipe.pubs.rows), pipe.pubs.rows
+    # 🔴 доказательство, что проверка выше вообще способна поймать пропажу:
+    # лист обязан отбрасывать колонку, которой нет в его заголовке. Без этой
+    # строки предыдущая проверяет заглушку, а не поведение живого листа.
+    pipe.pubs.append({"ID": "X", "Соответствие": "по сцене", "Выдуманная": "вот"})
+    assert "Выдуманная" not in pipe.pubs.rows[-1], (
+        "заглушка листа принимает любую колонку - значит проверки выше ничего "
+        "не доказывают: %s" % pipe.pubs.rows[-1])
+    assert pipe.pubs.rows[-1]["Соответствие"] == "по сцене", pipe.pubs.rows[-1]
+
+    # --- 26. 🔴 креатор отступил - оси помечены и владелец предупрежден ---
+    # Отступление не отменяет публикацию: ролик может быть хорошим. Оно отменяет
+    # **доверие к разметке**, поэтому строка помечается, а владелец получает то,
+    # что написал креатор, - чтобы поправить оси руками до замера на Д7.
+    plan = FakeSheet([{"ID": "P1-01", "Механика": "папа", "Ценность": "занят сам", "Описание к посту": "текст поста"}])
+    pipe, sheet = build([dict(row(status=T.APPROVED, date="2026-09-01", plan="P1-01",
+                                  comment="снял со столом, планшет сел"),
+                              **{T.COL_MATCH: ОТВЕТ_НЕТ})], plan=plan)
+    pipe.run()
+    assert pipe.pubs.rows, "отступление не должно отменять публикацию"
+    assert all(x.get("Соответствие") == T.MATCH_OFF for x in pipe.pubs.rows), pipe.pubs.rows
+    assert any("отступ" in n.lower() for n in pipe.bot.notes), (
+        "креатор отступил, а владельцу не сказали: %s" % pipe.bot.notes)
+    assert any("столом" in n for n in pipe.bot.notes), (
+        "владельцу не показали, что именно креатор написал: %s" % pipe.bot.notes)
+
+    # --- 27. 🔴 отметки нет вовсе - это «не подтверждено», а не «по сцене» ---
+    # Тишина не подтверждение (урок 23.08). Старые сдачи и сдачи мимо формы
+    # обязаны отличаться от подтвержденных, иначе дыра невидима.
+    plan = FakeSheet([{"ID": "P1-01", "Механика": "папа", "Описание к посту": "текст поста"}])
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01", plan="P1-01")],
+                        plan=plan)
+    pipe.run()
+    assert pipe.pubs.rows, "ничего не опубликовалось"
+    assert all(x.get("Соответствие") == T.MATCH_UNKNOWN for x in pipe.pubs.rows), (
+        "пустая отметка обязана читаться как «не подтверждено»: %s" % pipe.pubs.rows)
+
+    # --- 27б. разбор ответа не рассыпается от того, как креатор ответил ---
+    # Текст варианта в форме еще будет правиться руками, поэтому опора - первое
+    # слово, а не строка целиком. Незнакомый ответ - «не подтверждено»: выдумывать
+    # за креатора «наверное, по сцене» нельзя.
+    assert T.match_of("Да") == T.MATCH_OK
+    assert T.match_of("  да, все по сцене  ") == T.MATCH_OK
+    assert T.match_of("ДА, снял как написано") == T.MATCH_OK
+    assert T.match_of("Нет") == T.MATCH_OFF
+    assert T.match_of("нет, поменял товар") == T.MATCH_OFF
+    assert T.match_of("") == T.MATCH_UNKNOWN
+    assert T.match_of(None) == T.MATCH_UNKNOWN
+    assert T.match_of("частично") == T.MATCH_UNKNOWN, "незнакомое не выдаем за «да»"
+
+
+    # --- 🔴 подпись к посту берется из ПЛАНА, а не из служебной строки (31.08) ---
+    # Найдено ревизией процесса: caption = row.get(COL_PLAN), то есть в пост
+    # уходил идентификатор строки плана. Первая живая публикация 04.09 вышла бы
+    # с «P26-09» в подписи. Колонки «Описание к посту» не существовало вовсе.
+    план = FakeSheet([{u'ID': u'P26-09', u'Механика': u'папа',
+                       u'Описание к посту': u'Он два часа не вспоминал про планшет'}])
+    pipe, sheet = build([row(status=T.APPROVED, plan=u'P26-09')], plan=план)
+    pipe.run()
+    assert pipe.vk.posted, u'публикация не состоялась'
+    assert u'два часа' in pipe.vk.posted[0], (
+        u'в подпись ушло не описание: %r' % pipe.vk.posted[0])
+    assert u'P26-09' not in pipe.vk.posted[0], (
+        u'служебный ID уехал в подпись поста: %r' % pipe.vk.posted[0])
+
+    # ...и без описания строка НЕ публикуется молча: пустой пост хуже отказа
+    пустой = FakeSheet([{u'ID': u'P26-09', u'Механика': u'папа'}])
+    pipe2, sheet2 = build([row(status=T.APPROVED, plan=u'P26-09')], plan=пустой)
+    лог2 = u" ".join(pipe2.run())
+    assert not pipe2.vk.posted, u'строка без описания ушла в эфир пустой'
+    assert u'описан' in лог2.lower(), (
+        u'про пропажу описания никто не сказал: %s' % лог2)
+
+    # --- 28. 🔴 публикация идет через Postmypost, когда он подключен ---------
+    # Решение владельца 29.08: публикуем сервисом, потому что в ВК не работает
+    # ни один бесплатный путь. Свои токены Instagram и ВК при этом отключаются -
+    # иначе один ролик уйдет в эфир дважды.
+    pmp = FakePmp()
+    pipe, sheet = build([row(status=T.APPROVED)], pmp=pmp, accounts=PMP_ACCOUNTS)
+    pipe.run()
+    assert len(pmp.posted) == 1, "созревшая строка обязана уйти в сервис"
+    filename, caption, account_ids, post_at = pmp.posted[0]
+    assert caption == "текст поста", "в подпись идет описание из ПЛАНА: %r" % caption
+    assert "P26-09" not in caption, "🔴 служебный ID в подписи поста"
+    assert sorted(account_ids) == [2248535, 2248551], account_ids
+    assert post_at[:4] == "2026" and ("+" in post_at), \
+        "время публикации уходит по ISO 8601 с зоной, иначе сервис берет свою: %r" % post_at
+    assert not pipe.ig.posted and not pipe.vk.posted, \
+        "🔴 при работающем сервисе свои токены молчат, иначе ролик выйдет дважды"
+    assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED
+
+    # в учет ложится строка на каждую площадку, названную по chanel_id
+    # 🔴 Имена ровно те, что уже ходят по петле: metrics.py отбирает по строке
+    # "instagram", import_csv пишет ее же. Свое название развалило бы замер молча.
+    площадки = sorted(r["Площадка"] for r in pipe.pubs.rows)
+    assert площадки == ["instagram", "vk"], площадки
+    assert all(str(r["Медиа ID"]) == "31879606" for r in pipe.pubs.rows), \
+        "без id публикации сервиса ролик потом не найти"
+    assert all(r["Механика"] == "папа" for r in pipe.pubs.rows), \
+        "механика обязана доехать до учета и через сервис тоже"
+
+    # --- 29. 🔴 закрытый модуль API объясняется словами, а не трассировкой ----
+    from lib import postmypost as PMP
+    стена = PMP.TariffError("модуль «API» не включен")
+    pipe, sheet = build([row(status=T.APPROVED)], pmp=FakePmp(fail=стена),
+                        accounts=PMP_ACCOUNTS)
+    try:
+        pipe.run()
+    except PMP.TariffError:
+        raise AssertionError("стена тарифа обязана стать сообщением владельцу, "
+                             "а не падением такта")
+    assert any("модул" in n.lower() for n in pipe.bot.notes), pipe.bot.notes
+    assert sheet.rows[0][T.COL_STATUS] != T.PUBLISHED, \
+        "неопубликованное нельзя помечать опубликованным"
+
+    print("tick selftest OK: 29 проверок - полный путь, одна публикация за такт, "
           "идемпотентность, зависшее, сдвиг листа, ошибки, секреты, перевалка, "
           "публичный лог не выдает содержание, имена колонок сняты с живой формы, "
-          "механика доезжает до учета и ее пропажа слышна")
+          "механика доезжает до учета и ее пропажа слышна, отступление креатора "
+          "помечено и не выдается за замысел")
 
 
 if __name__ == "__main__":

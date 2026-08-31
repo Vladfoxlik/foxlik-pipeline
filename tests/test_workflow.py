@@ -68,6 +68,30 @@ def test_tick_holds_itself():
           "цепочка не подстраховывает суточный замер - при отказе cron петля встанет")
 
 
+def test_secrets_reach_the_tick():
+    """🔴 Оба конца связи: что такт читает из окружения - то расписание обязано дать.
+
+    Класс дефекта, сработавший за три дня четырежды и всегда молча: правится одна
+    сторона, вторая остается прежней, ни одна не падает. Здесь цена такая -
+    POSTMYPOST_TOKEN есть на машине, но не в tick.yml, и такт в облаке крутится
+    вхолостую: приемка идет, в эфир не выходит ничего, и никто не жалуется.
+    """
+    t = read("tick.yml")
+    код = (Path(__file__).resolve().parent.parent / "tick.py").read_text(encoding="utf-8")
+    нужны = set(re.findall(r'os\.environ(?:\.get)?[\[\(]"([A-Z0-9_]+)"', код))
+    # GOOGLE_SA_JSON приходит файлом ключа, его читает google_auth, а не tick
+    нужны.discard("GOOGLE_APPLICATION_CREDENTIALS")
+    for имя in sorted(нужны):
+        check(imya_v_yml(t, имя),
+              "tick.py читает %s, а расписание его не передает: в облаке узел молча "
+              "выключится" % имя)
+
+
+def imya_v_yml(text, name):
+    return re.search(r"^\s+%s:\s*\$\{\{\s*secrets\.%s\s*\}\}" % (name, name),
+                     text, re.M) is not None
+
+
 def test_metrics_not_on_the_hour():
     """Дока советует не ставить cron на начало часа: там пик нагрузки."""
     m = read("metrics.yml")
@@ -78,7 +102,8 @@ def test_metrics_not_on_the_hour():
 
 
 def main():
-    for fn in (test_tick_holds_itself, test_metrics_not_on_the_hour):
+    for fn in (test_tick_holds_itself, test_secrets_reach_the_tick,
+               test_metrics_not_on_the_hour):
         try:
             fn()
         except AssertionError as e:

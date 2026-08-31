@@ -28,10 +28,23 @@
 import datetime
 import hashlib
 import os
+import re
 import sys
 import traceback
 
-from lib import cloudinary, drive, google_auth, http, instagram, sheets, telegram, vk
+from lib import (cloudinary, drive, google_auth, http, instagram, postmypost,
+                 sheets, telegram, vk)
+
+# Каналы Postmypost, сняты живьем 31.08 запросом /channels.
+# 🔴 Имена площадок обязаны совпадать с теми, что уже ходят по петле: metrics.py
+# отбирает роликами со строкой ровно "instagram", а import_csv пишет ее же.
+# Разошлись бы - замер молча не нашел бы ни одного ролика.
+CHANNELS = {1: "instagram", 2: "vk", 6: "telegram", 7: "pinterest",
+            9: "tiktok", 16: "youtube"}
+
+# Публикация ставится на «сейчас плюс минута»: сервис забирает очередь не мгновенно,
+# а прошедшее время он отвергает. Зона московская - в ней живет вся наша таблица.
+MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 SHEET_SUBMISSIONS = "СДАЧИ"
 SHEET_PUBLICATIONS = "ПУБЛИКАЦИИ"
@@ -48,11 +61,48 @@ COL_TIME = "Отметка времени"
 # «Адрес электронной почты», а не «Электронная почта». Промах был бы молчаливым.
 COL_EMAIL = "Адрес электронной почты"
 COL_PLAN = "Строка плана"
+# 🔴 Подпись к посту (31.08). До этого в caption уходил COL_PLAN, то есть
+# идентификатор строки: первая живая публикация 04.09 вышла бы с «P1-01»
+# в тексте. Колонки не существовало вовсе - ревизия процесса нашла.
+COL_CAPTION = "Описание к посту"
 COL_FILE = "Файл"
 COL_COMMENT = "Комментарий"
 COL_STATUS = "Статус"
 COL_DATE = "Дата публикации"
 COL_REASON = "Причина отказа"
+# 🔴 Отметка креатора о том, снял ли он по сцене (разрыв А9, 29.08). Оси учета
+# едут из ПЛАНА в ПУБЛИКАЦИИ автоматически, то есть описывают **замысел**.
+# Снял иначе - словарь припишет результат ценности и товару, которых в кадре
+# не было, и через месяц предложит повторять то, чего не делали. Ошибка тихая:
+# ничего не падает и никто не спрашивает.
+# ✅ Имя снято с живой таблицы 30.08, а не выведено: вопрос добавлен в форму,
+# заголовки листа СДАЧИ прочитаны сервисным аккаунтом. Google поставил колонку
+# шестой - ПЕРЕД нашими «Статус», «Дата публикации», «Причина отказа». Код везде
+# читает по имени, а не по позиции, поэтому сдвиг ничего не сломал.
+COL_MATCH = "Сняли по сцене из задания?"
+
+# Канонические значения в ПУБЛИКАЦИЯХ. Текст ответа в форме длиннее и может
+# меняться, поэтому наружу выходит короткое слово, а разбор - в match_of.
+MATCH_OK = "по сцене"
+MATCH_OFF = "отступил"
+MATCH_UNKNOWN = "не подтверждено"
+
+
+def match_of(value):
+    """Ответ креатора → одно из трех состояний.
+
+    🔴 Пустота читается как «не подтверждено», а НЕ как «по сцене». Тишина -
+    не подтверждение (урок 23.08): старая сдача, сдача мимо формы и креатор,
+    пропустивший вопрос, обязаны отличаться от того, кто ответил «да».
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        return MATCH_UNKNOWN
+    if text.startswith("да"):
+        return MATCH_OK
+    if text.startswith("нет"):
+        return MATCH_OFF
+    return MATCH_UNKNOWN
 
 NEW = ""
 ACCEPTED = "ПРИНЯТ"
@@ -65,10 +115,15 @@ FAILED = "ОШИБКА"
 
 MAX_MB = 300            # предохранитель: больше в память раннера тянуть незачем
 
+# 🔴 Четыре оси учета помимо «Механики» (Ш2, 29.08). Переносятся из ПЛАНА
+# в ПУБЛИКАЦИИ, иначе словарь считает только по приему и не может ответить,
+# о чем был ролик, каким товаром, для какой боли и какими словами.
+AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "Сегмент")
+
 
 class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
-                 today=None, plan=None):
+                 today=None, plan=None, pmp=None, pmp_accounts=()):
         self.bot = bot
         self.sheet = sheet
         self.pubs = pubs
@@ -76,12 +131,46 @@ class Pipeline:
         self.ig = ig
         self.vk = vkontakte
         self.cloud = cloud
+        # 🔴 Postmypost старше своих токенов: когда он подключен, ig и vk молчат.
+        # Иначе один ролик уйдет в эфир дважды - и второй раз уже не отозвать.
+        self.pmp = pmp
+        self.pmp_accounts = list(pmp_accounts or ())
         self.plan = plan
         self.today = today or datetime.date.today()
         self.log = []
-        self._mechanics = None      # лист ПЛАН читается один раз на такт
+        self._mechanics = None
+        self._captions = {}      # лист ПЛАН читается один раз на такт
+        self._axes = None           # остальные четыре оси оттуда же
 
     # ---------- механика ролика ----------
+
+    def axes_of(self, plan_id):
+        """Все пять осей учета строки плана: {ось: значение}.
+
+        🔴 С 29.08 осей пять, а не одна (Ш2 в МОДЕЛЬ_КОНТЕНТА). Раньше ехала
+        только «Механика», и словарь умел ответить «прием папа дал 1,79», но
+        не «что именно сработало»: о чем ролик, каким товаром, для какой боли,
+        какими словами. Колонки в плане появились, а до ПУБЛИКАЦИЙ не доезжали -
+        то есть были текстом, которого петля не видит.
+        """
+        plan_id = self.plan_key(plan_id)
+        self._load_plan()
+        return self._axes.get(plan_id, {})
+
+    PLAN_ID = re.compile(r"^\s*([A-ZА-Я]?P?\d+-\d+)")
+
+    @classmethod
+    def plan_key(cls, value):
+        """ID строки плана из того, что выбрал креатор в форме.
+
+        🔴 Найдено ревизией процесса 31.08. В листе ПЛАН ключ - «P1-01», а в форме
+        человек выбирает пункт списка, и там рядом с номером обычно стоит подсказка:
+        «P1-01 · Спартак · световой планшет». Точного совпадения нет, и механика
+        строки не находилась - молча, одним предупреждением. Словарь после партии
+        доложил бы «считать нечего» и указал бы неверную причину.
+        """
+        m = cls.PLAN_ID.match(str(value or ""))
+        return m.group(1) if m else (value or "").strip()
 
     def mechanic_of(self, plan_id):
         """Механика строки плана. Без нее ролик выпадает из памяти петли.
@@ -98,20 +187,32 @@ class Pipeline:
         а стоит одного ролика в замере.
         """
         plan_id = (plan_id or "").strip()
-        if self._mechanics is None:
-            self._mechanics = {}
-            if self.plan is not None:
-                try:
-                    for row in self.plan.read():
-                        key = (row.get("ID") or "").strip()
-                        if key:
-                            self._mechanics[key] = (row.get("Механика") or "").strip()
-                except Exception as e:
-                    self.warn_mechanic("лист ПЛАН не прочитался: %s"
-                                       % http.mask(str(e))[:200])
-            else:
-                self.warn_mechanic("такту не передан лист ПЛАН")
+        self._load_plan()
         return self._mechanics.get(plan_id, "")
+
+    def _load_plan(self):
+        """Лист ПЛАН читается один раз на такт: и механика, и остальные оси."""
+        if self._mechanics is not None:
+            return
+        self._mechanics, self._axes, self._captions = {}, {}, {}
+        if self.plan is not None:
+            try:
+                for row in self.plan.read():
+                    key = (row.get("ID") or "").strip()
+                    if not key:
+                        continue
+                    self._mechanics[key] = (row.get("Механика") or "").strip()
+                    self._captions[key] = (row.get(COL_CAPTION) or "").strip()
+                    # Оси кроме механики: пустые не пишем, чтобы в ПУБЛИКАЦИЯХ
+                    # не появлялись колонки-пустышки на старых планах.
+                    self._axes[key] = dict(
+                        (ось, (row.get(ось) or "").strip())
+                        for ось in AXES_EXTRA if (row.get(ось) or "").strip())
+            except Exception as e:
+                self.warn_mechanic("лист ПЛАН не прочитался: %s"
+                                   % http.mask(str(e))[:200])
+        else:
+            self.warn_mechanic("такту не передан лист ПЛАН")
 
     def warn_mechanic(self, why):
         """Пропажа механики обязана быть слышной, но лог публичный.
@@ -229,12 +330,42 @@ class Pipeline:
         # 🔴 первым действием - метка. Она и есть защита от второго запуска.
         self.sheet.set(row["_row"], COL_STATUS, PUBLISHING)
         self.say("строка %s взята в публикацию" % row["_row"])
+        plan_key = self.plan_key(row.get(COL_PLAN))
+        self._load_plan()
+        caption = self._captions.get(plan_key, "")
+        if not caption:
+            # 🔴 Пустой пост хуже отказа: ролик уйдет в эфир без текста и ссылки,
+            # переснять его нельзя, а место в ленте уже занято. Останавливаемся
+            # и говорим вслух - строку допишет человек.
+            self.sheet.set(row["_row"], COL_STATUS, APPROVED)
+            self.say("строка %s: в ПЛАНЕ нет описания к посту для «%s» - "
+                     "публикация отложена" % (row["_row"], plan_key or "?"))
+            return
         name, content = self.disk.fetch(row[COL_FILE], max_mb=MAX_MB)
-        caption = row.get(COL_PLAN, "")
         links = {}
 
         media_ids = {}
-        if self.ig and self.cloud:
+        if self.pmp:
+            try:
+                pub_id = self.pmp.post_video_bytes(
+                    content, name, caption,
+                    [a["id"] for a in self.pmp_accounts], post_at_now())
+            except postmypost.TariffError as e:
+                # 🔴 Стена тарифа - не сбой сети: повторять запрос бессмысленно,
+                # нужен человек в биллинге. Строка возвращается в очередь целой.
+                self.sheet.set(row["_row"], COL_STATUS, APPROVED)
+                self.bot.notify("⛔ Postmypost не публикует: %s\nСтрока %s ждет."
+                                % (e, row["_row"]))
+                self.say("строка %s: %s" % (row["_row"], e))
+                return
+            for account in self.pmp_accounts:
+                platform = CHANNELS.get(account.get("chanel_id"), "площадка %s"
+                                        % account.get("chanel_id"))
+                # 🔴 Ссылки на пост в этот момент еще нет: сервис ставит публикацию
+                # в очередь и выдает свой id. По нему пост и находится потом.
+                links[platform] = ""
+                media_ids[platform] = pub_id
+        elif self.ig and self.cloud:
             public_id, url = self.cloud.upload(name, content)
             try:
                 result = self.ig.post_reel(url, caption)
@@ -243,14 +374,29 @@ class Pipeline:
                 media_ids["instagram"], links["instagram"] = result
             finally:
                 self.cloud.destroy(public_id)   # перевалка не должна копить файлы
-        if self.vk:
+        if self.vk and not self.pmp:
             links["vk"] = self.vk.publish(name, content, name=caption, message=caption)
 
-        plan_id = row.get(COL_PLAN, "")
+        # 🔴 Ключ, а не сырая строка формы. 31.08 починку сделали только для подписи
+        # к посту, а механика и пять осей остались на сыром значении «P1-01 · Спартак ·
+        # световой планшет» - и не находились. Прежние проверки брали чистый ID,
+        # поэтому дыра была невидима. Сюда же идет колонка ID листа ПУБЛИКАЦИИ:
+        # по ней замер связывает ролик с планом.
+        plan_id = plan_key
         mechanic = self.mechanic_of(plan_id)
         if not mechanic:
             self.warn_mechanic("строка %s не найдена в листе ПЛАН или механика "
                                "в ней пуста" % (plan_id or "без номера"))
+        # 🔴 Отступление не отменяет публикацию - ролик может быть хорошим.
+        # Оно отменяет доверие к разметке: оси в ПУБЛИКАЦИЯХ описывают замысел,
+        # а в кадре другое. Поэтому строка помечается, а владелец получает
+        # текст креатора и правит оси руками до замера на Д7.
+        match = match_of(row.get(COL_MATCH, ""))
+        if match == MATCH_OFF:
+            self.bot.notify("⚠️ Креатор отступил от сцены: %s\nЧто написал: %s\n"
+                            "Поправьте оси в ПУБЛИКАЦИЯХ до замера на Д7."
+                            % (plan_id or "без номера",
+                               (row.get(COL_COMMENT) or "").strip() or "без пояснения"))
         for platform, link in links.items():
             self.pubs.append({"ID": plan_id,
                               "Дата": self.today.isoformat(),
@@ -262,7 +408,15 @@ class Pipeline:
                               "Креатор": row.get(COL_EMAIL, ""),
                               # 🔴 без нее словарь механик пропустит этот ролик,
                               # и партия не попадет в память петли
-                              "Механика": mechanic})
+                              "Механика": mechanic,
+                              # 🔴 чему верить в пяти колонках справа: «по сцене» -
+                              # оси описывают кадр, «отступил» и «не подтверждено» -
+                              # только замысел. Словарь считает первые и вслух
+                              # называет, сколько отложил (А9, 29.08)
+                              "Соответствие": match,
+                              # четыре остальные оси учета (Ш2, 29.08): без них
+                              # словарь считает только по приему
+                              **self.axes_of(plan_id)})
         self.sheet.set(row["_row"], COL_STATUS, PUBLISHED)
         self.say("строка %s опубликована: %s" % (row["_row"], ", ".join(links) or "никуда"))
         self.bot.notify("📤 Опубликовано: %s\n%s" % (
@@ -318,6 +472,12 @@ def _as_date(value):
     return None
 
 
+def post_at_now(now=None):
+    """Время публикации для сервиса: ISO 8601 с зоной, минутой позже текущего."""
+    now = now or datetime.datetime.now(MSK)
+    return (now + datetime.timedelta(minutes=1)).replace(microsecond=0).isoformat()
+
+
 def from_env():
     """Собирает конвейер из секретов. Чего нет - тот узел просто выключен."""
     need = ("SHEET_ID", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID")
@@ -332,6 +492,20 @@ def from_env():
              if os.environ.get("CLOUDINARY_URL") else None)
     vkontakte = (vk.Vk(os.environ["VK_TOKEN"], os.environ["VK_GROUP_ID"])
                  if os.environ.get("VK_TOKEN") else None)
+    # 🔴 Postmypost старше своих токенов (решение владельца 29.08). Список аккаунтов
+    # спрашивается у сервиса, а не хранится у нас: подключить площадку можно в его
+    # кабинете в любой момент, и захардкоженный список молча отстал бы от жизни.
+    pmp, pmp_accounts = None, []
+    if os.environ.get("POSTMYPOST_TOKEN"):
+        pmp = postmypost.Postmypost(os.environ["POSTMYPOST_TOKEN"],
+                                    os.environ.get("POSTMYPOST_PROJECT_ID", 358244))
+        try:
+            pmp_accounts = [a for a in pmp.accounts()
+                            if a.get("connection_status") == 1]
+        except postmypost.TariffError as e:
+            # публиковать нечем - но такт обязан доработать: приемка и сдачи живут
+            print("Postmypost выключен: %s" % e, file=sys.stderr)
+            pmp = None
     return Pipeline(
         bot=telegram.Bot(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_OWNER_ID"]),
         sheet=sheets.Sheet(sa, sid, SHEET_SUBMISSIONS),
@@ -339,7 +513,8 @@ def from_env():
         # 🔴 Лист ПЛАН нужен ради одной колонки - «Механика». Без него ролик
         # уходит в учет обезличенным и выпадает из памяти петли.
         plan=sheets.Sheet(sa, sid, SHEET_PLAN),
-        disk=drive.Drive(sa), ig=ig, vkontakte=vkontakte, cloud=cloud)
+        disk=drive.Drive(sa), ig=ig, vkontakte=vkontakte, cloud=cloud,
+        pmp=pmp, pmp_accounts=pmp_accounts)
 
 
 def main():
