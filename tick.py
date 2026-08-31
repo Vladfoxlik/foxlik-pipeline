@@ -32,8 +32,8 @@ import re
 import sys
 import traceback
 
-from lib import (cloudinary, drive, google_auth, http, instagram, postmypost,
-                 sheets, telegram, vk)
+from lib import (cloudinary, drive, google_auth, http, instagram, platforms,
+                 postmypost, sheets, telegram, vk)
 
 # Каналы Postmypost, сняты живьем 31.08 запросом /channels.
 # 🔴 Имена площадок обязаны совпадать с теми, что уже ходят по петле: metrics.py
@@ -196,6 +196,48 @@ class Pipeline:
         self._load_plan()
         return self._mechanics.get(plan_id, "")
 
+    def article_of(self, plan_id):
+        """Артикул WB товара этой строки. Пусто - значит ссылку не выдумываем."""
+        self._load_plan()
+        товар = (self._axes.get(self.plan_key(plan_id), {}).get("Товар") or "").strip()
+        if not товар:
+            return ""
+        for строка in self._articles():
+            if строка["товар"] == товар.lower() and строка["основной"]:
+                return строка["артикул"]
+        return ""
+
+    def _articles(self):
+        """`data/артикулы.tsv`: номера найдены замером по 195 нашим постам."""
+        if getattr(self, "_articles_cache", None) is not None:
+            return self._articles_cache
+        out = []
+        путь = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            os.pardir, "data", "артикулы.tsv")
+        if os.path.exists(путь):
+            with open(путь, encoding="utf-8-sig") as f:
+                строки = [l.rstrip("\n").split("\t") for l in f if l.strip()]
+            head = строки[0]
+            for r in строки[1:]:
+                d = dict(zip(head, r))
+                if (d.get("Площадка") or "").strip().upper() != "WB":
+                    continue
+                out.append({"товар": (d.get("Товар") or "").strip().lower(),
+                            "артикул": (d.get("Артикул") or "").strip(),
+                            "основной": (d.get("Основной") or "").strip().lower() == "да"})
+        self._articles_cache = out
+        return out
+
+    def platform_rules(self):
+        """Правила упаковки по площадкам из `data/площадки.tsv`."""
+        if getattr(self, "_rules_cache", None) is not None:
+            return self._rules_cache
+        путь = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            os.pardir, "data", "площадки.tsv")
+        with open(путь, encoding="utf-8-sig") as f:
+            self._rules_cache = platforms.read_rules(f)
+        return self._rules_cache
+
     def _load_plan(self):
         """Лист ПЛАН читается один раз на такт: и механика, и остальные оси."""
         if self._mechanics is not None:
@@ -356,10 +398,17 @@ class Pipeline:
                 # день берем из строки сдачи (его проставил владелец при одобрении),
                 # час - из замера окон: 18:00 МСК
                 когда = post_at_for(_as_date(row.get(COL_DATE)) or self.today)
+                # 🔴 У каждой сети своя упаковка (31.08): в ВК ссылка кликается,
+                # в Instagram нет. Один текст на обе сети означал, что в одной
+                # из них он всегда неверный.
+                детали = platforms.details(
+                    self.pmp_accounts, caption,
+                    артикул=self.article_of(plan_key), file_ids=[0],
+                    rules=self.platform_rules())
                 pub_id = self.pmp.post_video_bytes(
                     content, name, caption,
                     [a["id"] for a in self.pmp_accounts], когда,
-                    черновик=self.вхолостую)
+                    черновик=self.вхолостую, details=детали)
             except postmypost.TariffError as e:
                 # 🔴 Стена тарифа - не сбой сети: повторять запрос бессмысленно,
                 # нужен человек в биллинге. Строка возвращается в очередь целой.

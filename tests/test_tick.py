@@ -133,10 +133,11 @@ class FakePmp:
         self.posted = []          # (имя файла, подпись, аккаунты, время)
 
     def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at,
-                         черновик=False):
+                         черновик=False, details=None):
         if self.fail:
             raise self.fail
-        self.posted.append((filename, content, list(account_ids), post_at, черновик))
+        self.posted.append((filename, content, list(account_ids), post_at, черновик,
+                            details))
         return 31879606           # id публикации в сервисе, снят живым прогоном 31.08
 
 
@@ -541,7 +542,7 @@ def selftest():
     pipe, sheet = build([row(status=T.APPROVED)], pmp=pmp, accounts=PMP_ACCOUNTS)
     pipe.run()
     assert len(pmp.posted) == 1, "созревшая строка обязана уйти в сервис"
-    filename, caption, account_ids, post_at, черновик = pmp.posted[0]
+    filename, caption, account_ids, post_at, черновик, _детали = pmp.posted[0]
     assert черновик is False, u"обычный такт публикует по-настоящему" 
     assert caption == "текст поста", "в подпись идет описание из ПЛАНА: %r" % caption
     assert "P26-09" not in caption, "🔴 служебный ID в подписи поста"
@@ -613,6 +614,26 @@ def selftest():
     pipe.run()
     assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED, \
         u"строка с датой-числом зависла бы навсегда"
+
+    # --- 28д. 🔴 у каждой сети своя упаковка поста (31.08) ------------------
+    # В ВК ссылка кликается, в Instagram нет. До этого в обе сети уходил один
+    # текст: в ВК человек видел номер, который нельзя нажать, а в Instagram
+    # мы заняли бы строку подписи ссылкой, которая не работает.
+    pmp = FakePmp()
+    план_с_товаром = FakeSheet([{"ID": "P26-09", "Механика": "папа",
+                                 "Товар": "световой стол",
+                                 "Описание к посту": "текст поста"}])
+    pipe, sheet = build([row(status=T.APPROVED)], pmp=pmp, accounts=PMP_ACCOUNTS,
+                        plan=план_с_товаром)
+    pipe.run()
+    детали = pmp.posted[0][5]
+    assert детали, u"такт публикует без деталей - упаковка по площадкам не доехала"
+    по_аккаунту = {d["account_id"]: d for d in детали}
+    вк = по_аккаунту[2248535]["content"]
+    иг = по_аккаунту[2248551]["content"]
+    assert "wildberries.ru/catalog/43287163" in вк, u"в ВК нет кликабельной ссылки: %s" % вк
+    assert "#43287163" in иг and "wildberries.ru" not in иг, \
+        u"в Instagram должен быть номер, а не нерабочая ссылка: %s" % иг
 
     # --- 29. 🔴 закрытый модуль API объясняется словами, а не трассировкой ----
     from lib import postmypost as PMP

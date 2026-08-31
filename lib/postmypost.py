@@ -160,14 +160,35 @@ class Postmypost:
         return self.create_publication(post_at=post_at, account_ids=account_ids,
                                        file_ids=[file_id], content=content)
 
+    def post_publication(self, post_at, account_ids, details, черновик=False):
+        """Публикация с готовыми деталями - по одной на аккаунт.
+
+        🔴 Так у каждой сети своя упаковка: в ВК кликабельная ссылка, в Instagram
+        артикул номером, у YouTube заголовок. Собирает их `lib/platforms.py`.
+        """
+        body = {"project_id": self.project, "post_at": post_at,
+                "account_ids": list(account_ids),
+                "publication_status": STATUS_DRAFT if черновик else STATUS_SCHEDULED,
+                "details": list(details)}
+        r = self._call("/publications", method="POST", body=body) or {}
+        pid = (r.get("data") or {}).get("id") if isinstance(r.get("data"), dict) \
+            else r.get("id")
+        if pid is None:
+            raise PublishError("публикация не создана: %s" % r)
+        return pid
+
     def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at,
-                         черновик=False):
+                         черновик=False, details=None):
         """То же для файла на руках - так публикуется ролик, скачанный с Диска.
 
         `черновик=True` - холостой прогон: путь проходится целиком, но публикация
         остается в кабинете со статусом «черновик» и в ленту не выходит.
         """
         file_id = self.upload_bytes(content_bytes, filename)
+        if details is not None:
+            # детали приходят готовыми, но file_id известен только сейчас
+            готовые = [dict(d, file_ids=[file_id]) for d in details]
+            return self.post_publication(post_at, account_ids, готовые, черновик)
         return self.create_publication(
             post_at=post_at, account_ids=account_ids, file_ids=[file_id],
             content=content,
