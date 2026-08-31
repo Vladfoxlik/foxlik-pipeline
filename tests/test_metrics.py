@@ -30,6 +30,25 @@ def pub(pid, date, media="M1", platform="instagram"):
             "Ссылка": "https://instagram.com/reel/x", "Медиа ID": media}
 
 
+def test_google_serial_date():
+    """🔴 Дата в таблице приходит числом, а не строкой (найдено прогоном 31.08).
+
+    Такт пишет «2026-08-31», Google принимает значение как USER_ENTERED и хранит
+    его своим серийным номером - при чтении возвращается «46265». Замер отбирает
+    ролики по дате: неразобранная дата означает «ролик не созрел», и он не попал
+    бы в замер НИКОГДА. Ошибка полностью молчаливая: в логе «замерять нечего».
+    """
+    import metrics as M
+    assert M._as_date("2026-08-31") == datetime.date(2026, 8, 31)
+    assert M._as_date("46265") == datetime.date(2026, 8, 31), \
+        u"серийный номер Google не разобран - ролик выпадет из замера"
+    assert M._as_date(46265) == datetime.date(2026, 8, 31)
+    # не всякое число - дата: пустое и мусор по-прежнему None
+    assert M._as_date("") is None and M._as_date("позавчера") is None
+    # и не всякое маленькое число: 1-2 значные - это чей-то мусор, не дата
+    assert M._as_date("5") is None, u"«5» это не 1900 год, а мусор в ячейке"
+
+
 def build(pubs, measured=(), answers=None, today=TODAY):
     m = M.Metrics(ig=FakeIG(), pubs=FakeSheet(list(pubs)),
                   metrics_sheet=FakeSheet(list(measured)),
@@ -39,6 +58,7 @@ def build(pubs, measured=(), answers=None, today=TODAY):
 
 
 def selftest():
+    test_google_serial_date()
     # --- счет гейта ---
     assert M.per_1000(15, 10000) == 1.5
     assert M.per_1000(3, 10000) == 0.3

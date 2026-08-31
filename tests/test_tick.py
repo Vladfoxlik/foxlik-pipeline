@@ -132,10 +132,11 @@ class FakePmp:
         self.fail = fail
         self.posted = []          # (имя файла, подпись, аккаунты, время)
 
-    def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at):
+    def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at,
+                         черновик=False):
         if self.fail:
             raise self.fail
-        self.posted.append((filename, content, list(account_ids), post_at))
+        self.posted.append((filename, content, list(account_ids), post_at, черновик))
         return 31879606           # id публикации в сервисе, снят живым прогоном 31.08
 
 
@@ -153,7 +154,7 @@ def row(status="", plan="P26-09 · папа собирает столик", date
 
 
 def build(rows, presses=(), ig=None, disk=None, today=TODAY, plan=False,
-          pmp=None, accounts=()):
+          pmp=None, accounts=(), вхолостую=False):
     sheet = FakeSheet(rows)
     if plan is False:
         # 🔴 С 31.08 такт берет подпись к посту из листа ПЛАН и без нее публикацию
@@ -176,7 +177,7 @@ def build(rows, presses=(), ig=None, disk=None, today=TODAY, plan=False,
                       pubs=FakeSheet([], header=list(S.LAYOUT["ПУБЛИКАЦИИ"])),
                       disk=disk or FakeDrive(), ig=ig if ig is not None else FakeIG(),
                       vkontakte=FakeVK(), cloud=FakeCloud(), today=today, plan=plan,
-                      pmp=pmp, pmp_accounts=accounts)
+                      pmp=pmp, pmp_accounts=accounts, вхолостую=вхолостую)
     return pipe, sheet
 
 
@@ -540,7 +541,8 @@ def selftest():
     pipe, sheet = build([row(status=T.APPROVED)], pmp=pmp, accounts=PMP_ACCOUNTS)
     pipe.run()
     assert len(pmp.posted) == 1, "созревшая строка обязана уйти в сервис"
-    filename, caption, account_ids, post_at = pmp.posted[0]
+    filename, caption, account_ids, post_at, черновик = pmp.posted[0]
+    assert черновик is False, u"обычный такт публикует по-настоящему" 
     assert caption == "текст поста", "в подпись идет описание из ПЛАНА: %r" % caption
     assert "P26-09" not in caption, "🔴 служебный ID в подписи поста"
     assert sorted(account_ids) == [2248535, 2248551], account_ids
@@ -577,6 +579,40 @@ def selftest():
     вчерашняя = T.post_at_for(datetime.date(2026, 9, 3),
                               now=datetime.datetime(2026, 9, 4, 9, 0, tzinfo=T.MSK))
     assert вчерашняя.startswith("2026-09-04T09:0"), вчерашняя
+
+    # --- 28в. 🔴 холостой прогон: весь путь без выхода в эфир ---------------
+    # Цепочка «сдача → приемка → эфир» ни разу не проходила целиком: проверены
+    # куски. Проверить ее на живом ролике значит опубликовать его по-настоящему
+    # в аккаунт на 415 тыс. подписчиков. Поэтому у такта есть холостой режим:
+    # все шаги настоящие, а публикация создается ЧЕРНОВИКОМ и в ленту не идет.
+    pmp = FakePmp()
+    pipe, sheet = build([row(status=T.APPROVED)], pmp=pmp, accounts=PMP_ACCOUNTS,
+                        вхолостую=True)
+    pipe.run()
+    assert len(pmp.posted) == 1, u"холостой прогон обязан пройти весь путь"
+    assert pmp.posted[0][4] is True, u"публикация не помечена черновиком"
+    assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED
+    # 🔴 и это должно быть видно человеку: строка в учете, помеченная как проба,
+    # иначе холостой ролик уедет в словарь механик и испортит замер
+    assert all(u"холост" in (r.get("Соответствие") or "").lower()
+               for r in pipe.pubs.rows), pipe.pubs.rows
+
+    # --- 28г. 🔴 дата из таблицы приходит числом Google ---------------------
+    # Тот же дефект, что найден в замере холостым прогоном 31.08, живет и здесь:
+    # такт пишет «2026-09-04», Google хранит дату СВОИМ числом и возвращает
+    # «46265». Строка с неразобранной датой считается несозревшей - и не
+    # публикуется никогда, молча.
+    assert T._as_date("46265") == datetime.date(2026, 8, 31), \
+        u"серийный номер Google не разобран - строка не созреет никогда"
+    assert T._as_date("2026-09-04") == datetime.date(2026, 9, 4)
+    assert T._as_date("7") is None, u"однозначное число - мусор, а не дата"
+
+    серийная = row(status=T.APPROVED, date="46265")   # 31.08.2026, уже наступила
+    pipe, sheet = build([серийная], pmp=FakePmp(), accounts=PMP_ACCOUNTS,
+                        today=datetime.date(2026, 9, 4))
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED, \
+        u"строка с датой-числом зависла бы навсегда"
 
     # --- 29. 🔴 закрытый модуль API объясняется словами, а не трассировкой ----
     from lib import postmypost as PMP

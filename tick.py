@@ -123,7 +123,13 @@ AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "
 
 class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
-                 today=None, plan=None, pmp=None, pmp_accounts=()):
+                 today=None, plan=None, pmp=None, pmp_accounts=(), вхолостую=False):
+        # 🔴 Холостой прогон (31.08). Цепочка «сдача → приемка → эфир» ни разу
+        # не проходила целиком, а проверить ее на живом ролике значит опубликовать
+        # его по-настоящему в аккаунт на 415 тыс. подписчиков. В этом режиме все
+        # шаги настоящие - файл скачивается, грузится в сервис, публикация
+        # создается, - но со статусом «черновик»: в ленту не выходит ничего.
+        self.вхолостую = вхолостую
         self.bot = bot
         self.sheet = sheet
         self.pubs = pubs
@@ -352,7 +358,8 @@ class Pipeline:
                 когда = post_at_for(_as_date(row.get(COL_DATE)) or self.today)
                 pub_id = self.pmp.post_video_bytes(
                     content, name, caption,
-                    [a["id"] for a in self.pmp_accounts], когда)
+                    [a["id"] for a in self.pmp_accounts], когда,
+                    черновик=self.вхолостую)
             except postmypost.TariffError as e:
                 # 🔴 Стена тарифа - не сбой сети: повторять запрос бессмысленно,
                 # нужен человек в биллинге. Строка возвращается в очередь целой.
@@ -416,7 +423,11 @@ class Pipeline:
                               # оси описывают кадр, «отступил» и «не подтверждено» -
                               # только замысел. Словарь считает первые и вслух
                               # называет, сколько отложил (А9, 29.08)
-                              "Соответствие": match,
+                              # 🔴 Холостая строка обязана быть видна в учете:
+                              # иначе проба уедет в словарь механик наравне
+                              # с настоящим роликом и испортит замер приема.
+                              "Соответствие": ("холостой прогон" if self.вхолостую
+                                               else match),
                               # четыре остальные оси учета (Ш2, 29.08): без них
                               # словарь считает только по приему
                               **self.axes_of(plan_id)})
@@ -472,7 +483,19 @@ def _as_date(value):
             return datetime.datetime.strptime(text, fmt).date()
         except ValueError:
             continue
+    # 🔴 Google хранит дату своим числом и возвращает «46265» вместо «2026-08-31»
+    # (найдено холостым прогоном 31.08). Неразобранная дата означает «строка
+    # не созрела» - и она не опубликуется никогда, без единого сообщения.
+    # Пятизначность - защита от мусора: «7» это не 1900 год, а чья-то опечатка.
+    if text.isdigit() and len(text) >= 5:
+        try:
+            return GOOGLE_EPOCH + datetime.timedelta(days=int(text))
+        except (ValueError, OverflowError):
+            return None
     return None
+
+
+GOOGLE_EPOCH = datetime.date(1899, 12, 30)   # день 0 в счете Google Sheets
 
 
 def post_at_now(now=None):
@@ -539,7 +562,10 @@ def from_env():
         # уходит в учет обезличенным и выпадает из памяти петли.
         plan=sheets.Sheet(sa, sid, SHEET_PLAN),
         disk=drive.Drive(sa), ig=ig, vkontakte=vkontakte, cloud=cloud,
-        pmp=pmp, pmp_accounts=pmp_accounts)
+        pmp=pmp, pmp_accounts=pmp_accounts,
+        # 🔴 Холостой прогон включается переменной среды, а не флагом командной
+        # строки: такт запускается из расписания, где аргументы не передашь.
+        вхолостую=bool(os.environ.get("DRY_RUN")))
 
 
 def main():

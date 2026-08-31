@@ -81,6 +81,10 @@ def test_secrets_reach_the_tick():
     нужны = set(re.findall(r'os\.environ(?:\.get)?[\[\(]"([A-Z0-9_]+)"', код))
     # GOOGLE_SA_JSON приходит файлом ключа, его читает google_auth, а не tick
     нужны.discard("GOOGLE_APPLICATION_CREDENTIALS")
+    # 🔴 DRY_RUN - не секрет, а режим холостого прогона: он включается руками
+    # на разовом запуске и в расписании стоять НЕ должен. Иначе облако будет
+    # вечно публиковать черновики, и это заметят только по пустой ленте.
+    нужны.discard("DRY_RUN")
     for имя in sorted(нужны):
         check(imya_v_yml(t, имя),
               "tick.py читает %s, а расписание его не передает: в облаке узел молча "

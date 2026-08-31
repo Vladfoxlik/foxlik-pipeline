@@ -313,13 +313,32 @@ class Metrics:
         self.bot.notify("\n".join(lines))
 
 
+GOOGLE_EPOCH = datetime.date(1899, 12, 30)   # день 0 в счете Google Sheets
+
+
 def _as_date(value):
+    """Дата из ячейки. Понимает и текст, и серийный номер Google.
+
+    🔴 Найдено холостым прогоном 31.08. Такт пишет «2026-08-31», Google принимает
+    значение как USER_ENTERED и хранит его СВОИМ числом - при чтении приходит
+    «46265». Замер отбирает ролики по дате, неразобранная дата означает «еще
+    не созрел», и ролик не попал бы в замер никогда. В логе при этом честное
+    «замерять нечего»: ошибка полностью молчаливая.
+
+    Число тоже проверяется на разумность: однозначное или двузначное - это
+    чей-то мусор в ячейке, а не 1900 год.
+    """
     text = str(value or "").strip()[:10]
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
         try:
             return datetime.datetime.strptime(text, fmt).date()
         except ValueError:
             continue
+    if text.isdigit() and len(text) >= 5:
+        try:
+            return GOOGLE_EPOCH + datetime.timedelta(days=int(text))
+        except (ValueError, OverflowError):
+            return None
     return None
 
 

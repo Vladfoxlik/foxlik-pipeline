@@ -160,11 +160,18 @@ class Postmypost:
         return self.create_publication(post_at=post_at, account_ids=account_ids,
                                        file_ids=[file_id], content=content)
 
-    def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at):
-        """То же для файла на руках - так публикуется ролик, скачанный с Диска."""
+    def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at,
+                         черновик=False):
+        """То же для файла на руках - так публикуется ролик, скачанный с Диска.
+
+        `черновик=True` - холостой прогон: путь проходится целиком, но публикация
+        остается в кабинете со статусом «черновик» и в ленту не выходит.
+        """
         file_id = self.upload_bytes(content_bytes, filename)
-        return self.create_publication(post_at=post_at, account_ids=account_ids,
-                                       file_ids=[file_id], content=content)
+        return self.create_publication(
+            post_at=post_at, account_ids=account_ids, file_ids=[file_id],
+            content=content,
+            publication_status=STATUS_DRAFT if черновик else STATUS_SCHEDULED)
 
 
 def selftest():
