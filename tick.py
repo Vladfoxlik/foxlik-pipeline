@@ -347,9 +347,12 @@ class Pipeline:
         media_ids = {}
         if self.pmp:
             try:
+                # день берем из строки сдачи (его проставил владелец при одобрении),
+                # час - из замера окон: 18:00 МСК
+                когда = post_at_for(_as_date(row.get(COL_DATE)) or self.today)
                 pub_id = self.pmp.post_video_bytes(
                     content, name, caption,
-                    [a["id"] for a in self.pmp_accounts], post_at_now())
+                    [a["id"] for a in self.pmp_accounts], когда)
             except postmypost.TariffError as e:
                 # 🔴 Стена тарифа - не сбой сети: повторять запрос бессмысленно,
                 # нужен человек в биллинге. Строка возвращается в очередь целой.
@@ -476,6 +479,28 @@ def post_at_now(now=None):
     """Время публикации для сервиса: ISO 8601 с зоной, минутой позже текущего."""
     now = now or datetime.datetime.now(MSK)
     return (now + datetime.timedelta(minutes=1)).replace(microsecond=0).isoformat()
+
+
+def post_at_for(день, now=None):
+    """Когда выпустить ролик: в 18:00 МСК назначенного дня.
+
+    🔴 Час выбран замером, а не привычкой. 263 ролика, посчитано 29.07: **18:00
+    дает ×1,26** к просмотрам на 26 роликах, а 17:00, где выходила половина нашей
+    ленты, - ×0,84. Худшее окно 14:00 (×0,73). Смещение постинга на час стоит
+    ~1,5 тыс. просмотров на ролик и не требует ни одной правки в контенте.
+    Подписки от часа не зависят - их строит содержание.
+
+    Раньше такт публиковал в момент, когда проснулся, то есть в случайный час:
+    сервис умеет отложенную публикацию, и не пользоваться этим было потерей.
+
+    Если окно дня уже прошло (или день в прошлом - такт стоял), ролик уходит
+    сразу: ждать сутки ради множителя дороже, чем выйти в неидеальный час.
+    """
+    now = now or datetime.datetime.now(MSK)
+    окно = datetime.datetime.combine(день, datetime.time(18, 0), tzinfo=MSK)
+    if окно <= now:
+        return post_at_now(now)
+    return окно.isoformat()
 
 
 def from_env():
