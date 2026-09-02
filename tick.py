@@ -115,10 +115,34 @@ FAILED = "ОШИБКА"
 
 MAX_MB = 300            # предохранитель: больше в память раннера тянуть незачем
 
+
+def _data_file(имя, roots=None):
+    """Путь к справочнику `data/<имя>` в любой из двух раскладок.
+
+    🔴 Локально data/ лежит НАД pipeline/, а в публичном репо foxlik-pipeline
+    код публикуется снимком папки в корень - и data/ там РЯДОМ с tick.py.
+    Жесткий путь "../data" в облаке падал бы на ПЕРВОЙ живой публикации,
+    молча для всех тактов до нее: без публикации упаковка не вызывается.
+    Пропажа файла - вслух, с перечнем мест, где искали.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [os.path.join(here, os.pardir), here] if roots is None else roots
+    искали = []
+    for root in roots:
+        путь = os.path.join(root, "data", имя)
+        искали.append(путь)
+        if os.path.exists(путь):
+            return путь
+    raise SystemExit("нет справочника %s, искали: %s" % (имя, "; ".join(искали)))
+
 # 🔴 Четыре оси учета помимо «Механики» (Ш2, 29.08). Переносятся из ПЛАНА
 # в ПУБЛИКАЦИИ, иначе словарь считает только по приему и не может ответить,
 # о чем был ролик, каким товаром, для какой боли и какими словами.
-AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "Сегмент")
+# 🔴 «Роль товара» и «Ситуация» добавлены 02.09: первая - ручка баланса
+# репосты/подписки (замер 26.08), вторая - код из МЕТОДИКА_ИДЕЙ, точный
+# межнедельный анти-дубль. Без переноса сюда словарь по этим осям слеп.
+AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "Сегмент",
+              "Роль товара", "Ситуация")
 
 
 class Pipeline:
@@ -146,6 +170,7 @@ class Pipeline:
         self.log = []
         self._mechanics = None
         self._captions = {}      # лист ПЛАН читается один раз на такт
+        self._slots = {}         # ID -> (номер внутри дня, всего в дне)
         self._axes = None           # остальные четыре оси оттуда же
 
     # ---------- механика ролика ----------
@@ -196,33 +221,53 @@ class Pipeline:
         self._load_plan()
         return self._mechanics.get(plan_id, "")
 
-    def article_of(self, plan_id):
-        """Артикул WB товара этой строки. Пусто - значит ссылку не выдумываем."""
+    def product_of(self, plan_id):
+        """Название товара этой строки плана - ключ к артикулам и ссылкам."""
         self._load_plan()
-        товар = (self._axes.get(self.plan_key(plan_id), {}).get("Товар") or "").strip()
+        return (self._axes.get(self.plan_key(plan_id), {}).get("Товар") or "").strip()
+
+    def article_of(self, plan_id, площадка="WB"):
+        """Артикул товара этой строки. Пусто - значит ссылку не выдумываем."""
+        товар = self.product_of(plan_id)
         if not товар:
             return ""
         for строка in self._articles():
-            if строка["товар"] == товар.lower() and строка["основной"]:
+            if (строка["товар"] == товар.lower()
+                    and строка["площадка"] == площадка.upper()
+                    and (строка["основной"] or площадка.upper() != "WB")):
                 return строка["артикул"]
         return ""
+
+    def links(self):
+        """Ссылки Mobzio из `data/mobzio.tsv`: {(товар, площадка): url}.
+
+        🔴 Решение владельца 02.09: ведем не на wildberries.ru, а на короткую
+        ссылку Mobzio - она открывает товар в приложении маркетплейса, где
+        человек уже авторизован, и метит источник перехода.
+        """
+        if getattr(self, "_links_cache", None) is not None:
+            return self._links_cache
+        путь = _data_file("mobzio.tsv")
+        with open(путь, encoding="utf-8-sig") as f:
+            self._links_cache = platforms.read_links(f)
+        return self._links_cache
 
     def _articles(self):
         """`data/артикулы.tsv`: номера найдены замером по 195 нашим постам."""
         if getattr(self, "_articles_cache", None) is not None:
             return self._articles_cache
         out = []
-        путь = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            os.pardir, "data", "артикулы.tsv")
+        путь = _data_file("артикулы.tsv")
         if os.path.exists(путь):
             with open(путь, encoding="utf-8-sig") as f:
                 строки = [l.rstrip("\n").split("\t") for l in f if l.strip()]
             head = строки[0]
             for r in строки[1:]:
                 d = dict(zip(head, r))
-                if (d.get("Площадка") or "").strip().upper() != "WB":
-                    continue
+                # 🔴 С 02.09 берем и Ozon: его артикул ставится в подпись рядом
+                # с WB (решение владельца). Раньше строки Ozon отбрасывались.
                 out.append({"товар": (d.get("Товар") or "").strip().lower(),
+                            "площадка": (d.get("Площадка") or "").strip().upper(),
                             "артикул": (d.get("Артикул") or "").strip(),
                             "основной": (d.get("Основной") or "").strip().lower() == "да"})
         self._articles_cache = out
@@ -232,9 +277,7 @@ class Pipeline:
         """Правила упаковки по площадкам из `data/площадки.tsv`."""
         if getattr(self, "_rules_cache", None) is not None:
             return self._rules_cache
-        путь = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            os.pardir, "data", "площадки.tsv")
-        with open(путь, encoding="utf-8-sig") as f:
+        with open(_data_file("площадки.tsv"), encoding="utf-8-sig") as f:
             self._rules_cache = platforms.read_rules(f)
         return self._rules_cache
 
@@ -243,9 +286,12 @@ class Pipeline:
         if self._mechanics is not None:
             return
         self._mechanics, self._axes, self._captions = {}, {}, {}
+        self._slots = {}
         if self.plan is not None:
             try:
-                for row in self.plan.read():
+                строки_плана = self.plan.read()
+                self._slots = day_slots(строки_плана)
+                for row in строки_плана:
                     key = (row.get("ID") or "").strip()
                     if not key:
                         continue
@@ -396,15 +442,22 @@ class Pipeline:
         if self.pmp:
             try:
                 # день берем из строки сдачи (его проставил владелец при одобрении),
-                # час - из замера окон: 18:00 МСК
-                когда = post_at_for(_as_date(row.get(COL_DATE)) or self.today)
+                # час - из замера окон; два ролика дня разводятся по 11:00/18:00
+                slot, of = self._slots.get(plan_key, (0, 1))
+                когда = post_at_for(_as_date(row.get(COL_DATE)) or self.today,
+                                    slot=slot, of=of)
                 # 🔴 У каждой сети своя упаковка (31.08): в ВК ссылка кликается,
                 # в Instagram нет. Один текст на обе сети означал, что в одной
                 # из них он всегда неверный.
                 детали = platforms.details(
                     self.pmp_accounts, caption,
                     артикул=self.article_of(plan_key), file_ids=[0],
-                    rules=self.platform_rules())
+                    rules=self.platform_rules(),
+                    # 🔴 02.09: ведем на короткую ссылку Mobzio, а не на WB
+                    # напрямую - она открывает товар в приложении маркетплейса
+                    # у уже авторизованного человека и метит источник перехода.
+                    ozon=self.article_of(plan_key, "Ozon"),
+                    links=self.links(), товар=self.product_of(plan_key))
                 pub_id = self.pmp.post_video_bytes(
                     content, name, caption,
                     [a["id"] for a in self.pmp_accounts], когда,
@@ -553,8 +606,37 @@ def post_at_now(now=None):
     return (now + datetime.timedelta(minutes=1)).replace(microsecond=0).isoformat()
 
 
-def post_at_for(день, now=None):
-    """Когда выпустить ролик: в 18:00 МСК назначенного дня.
+# Окна дня, сведение 02.09 (аналитика/ОКНА_ПУБЛИКАЦИИ_2026-09-02.md):
+# 18:00 - наш замер (×1,26 на 26 роликах, надежно); 21:00 - консенсус чужих
+# данных (пик Mediascope 20-23, LiveDune ВК 16-21+, «мамы после укладывания»,
+# наш 20:00 ×1,96 на 4 роликах рядом). Утро 11:00 снято: наш ×1,39 стоял на
+# малых данных, а для ВК будний день - худшая зона (LiveDune, 30 млн постов).
+# Порядок в кортеже - от раннего к позднему; W36 даст свой замер обоих окон.
+ОКНА_ДНЯ = (datetime.time(18, 0), datetime.time(21, 0))
+
+
+def day_slots(plan_rows):
+    """plan_id -> (номер внутри дня, всего в дне) по колонке «Дата в эфир».
+
+    🔴 С недели W36 в день выходит по ДВА ролика в один аккаунт. Без номера
+    внутри дня оба вставали на одну минуту - вид спама и порча замера: ролики
+    конкурируют в раздаче в один и тот же момент.
+    """
+    по_дням = {}
+    for r in plan_rows:
+        key = (r.get("ID") or "").strip()
+        день = (r.get("Дата в эфир") or "").strip()
+        if key and день:
+            по_дням.setdefault(день, []).append(key)
+    out = {}
+    for ids in по_дням.values():
+        for i, key in enumerate(sorted(ids)):
+            out[key] = (i, len(ids))
+    return out
+
+
+def post_at_for(день, now=None, slot=0, of=1):
+    """Когда выпустить ролик: в замеренное окно назначенного дня.
 
     🔴 Час выбран замером, а не привычкой. 263 ролика, посчитано 29.07: **18:00
     дает ×1,26** к просмотрам на 26 роликах, а 17:00, где выходила половина нашей
@@ -562,14 +644,29 @@ def post_at_for(день, now=None):
     ~1,5 тыс. просмотров на ролик и не требует ни одной правки в контенте.
     Подписки от часа не зависят - их строит содержание.
 
-    Раньше такт публиковал в момент, когда проснулся, то есть в случайный час:
-    сервис умеет отложенную публикацию, и не пользоваться этим было потерей.
+    Единственный ролик дня идет в 18:00 - лучшее из надежных окон. Два ролика
+    разводятся по ОКНА_ДНЯ (18:00 и 21:00, сведение 02.09), и порядок окон
+    чередуется по дате: ID внутри дня всегда в одном порядке (нечетный -
+    Ксения), без чередования одно окно приклеилось бы к одному креатору,
+    и эффект окна смешался бы с человеком.
 
     Если окно дня уже прошло (или день в прошлом - такт стоял), ролик уходит
     сразу: ждать сутки ради множителя дороже, чем выйти в неидеальный час.
     """
     now = now or datetime.datetime.now(MSK)
-    окно = datetime.datetime.combine(день, datetime.time(18, 0), tzinfo=MSK)
+    if of <= 1:
+        час = datetime.time(18, 0)
+    else:
+        окна = list(ОКНА_ДНЯ) if день.toordinal() % 2 == 0 else \
+            list(reversed(ОКНА_ДНЯ))
+        час = окна[min(slot, len(окна) - 1)]
+    # 🔴 Некруглые минуты (владелец 02.09): 18:07 живее роботного 18:00.
+    # Сдвиг ТОЛЬКО вперед на 1..9 минут - минус утянул бы в 17:5x, наше
+    # замеренно худшее окно (17:00 ×0,84). Детерминирован датой и слотом:
+    # повторный пересчет дает то же время, разные дни - разные минуты.
+    сдвиг = (день.toordinal() * 31 + slot * 17) % 9 + 1
+    окно = (datetime.datetime.combine(день, час, tzinfo=MSK)
+            + datetime.timedelta(minutes=сдвиг))
     if окно <= now:
         return post_at_now(now)
     return окно.isoformat()

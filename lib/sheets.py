@@ -96,6 +96,27 @@ class Sheet:
                               % (self.title, name, ", ".join(self.header) or "ничего"))
         return a1_column(self.header.index(name))
 
+    def set_header(self, header):
+        """Переписывает строку заголовка целиком.
+
+        🔴 Нужен там, где схема листа живет в коде и может поменяться (лист
+        креаторов, 31.08). Без него правка состава или порядка колонок остается
+        в репозитории и до человека не доходит: append раскладывает значения
+        по СТАРОМУ заголовку, ничего при этом не роняя.
+        """
+        # 🔴 Новый заголовок короче старого - хвост обязан затереться пустыми:
+        # без этого после двух миграций на живом листе «Комментарий» стоял
+        # трижды (найдено 02.09 чтением обратно), а дубликаты колонок молча
+        # ломают чтение по именам.
+        if not self.header:
+            self.read()
+        строка = list(header) + [""] * max(0, len(self.header) - len(header))
+        rng = "%s!A%s:%s%s" % (self.title, HEADER_ROW,
+                               a1_column(len(строка) - 1), HEADER_ROW)
+        self._put(rng, [строка])
+        self.header = list(header)
+        return self.header
+
     def set(self, row, column_name, value):
         """Пишет одну ячейку. row - это _row из read(), уже с поправкой на заголовок."""
         cell = "%s!%s%s" % (self.title, self.column_letter(column_name), row)
@@ -247,6 +268,19 @@ def selftest():
         add = calls[-1]
         assert add["url"].endswith(":batchUpdate")
         assert add["body"]["requests"][0]["addSheet"]["properties"]["title"] == "МЕТРИКИ"
+
+        # --- 🔴 заголовок стал короче - хвост старого затирается (02.09) ---
+        # Найдено на живом листе: после двух миграций «Комментарий» стоял
+        # трижды - set_header писал ровно len(header) ячеек, а старый хвост
+        # справа оставался. Дубликаты колонок молча ломают чтение по именам.
+        http.request = fake
+        table = [["ID", "Статус", "Дата публикации", "Причина отказа"]]
+        короткий = Sheet(FakeSA(), "SID", "СДАЧИ")
+        короткий.set_header(["ID", "Статус"])
+        put = calls[-1]
+        assert put["method"] == "PUT", put
+        assert put["body"]["values"][0] == ["ID", "Статус", "", ""], (
+            "хвост старого заголовка обязан затереться: %r" % put["body"])
 
         # --- пустой лист не должен падать ---
         http.request = fake
