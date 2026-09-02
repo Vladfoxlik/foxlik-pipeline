@@ -92,9 +92,15 @@ class Bot:
         return r["message_id"]
 
     def notify(self, text, chat_id=None):
-        """Уведомление без кнопок. Через это идут все ошибки конвейера."""
+        """Уведомление без кнопок. Через это идут все ошибки конвейера.
+
+        🔴 Аудит 02.09: тексты ошибок уходят с parse_mode=HTML, и «<» в теле
+        (HTML-страница 503 от Google) давал Telegram 400 - уведомление НЕ
+        доходило, а лог утверждал «подробности отправлены владельцу».
+        Разметка нам не нужна - шлем без parse_mode, как есть.
+        """
         return self.call("sendMessage", chat_id=chat_id or self.owner,
-                         text=text, parse_mode="HTML")["message_id"]
+                         text=text)["message_id"]
 
     # ---------- чтение ----------
 

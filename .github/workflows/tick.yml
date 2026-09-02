@@ -66,7 +66,7 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 70     # 11 тактов по 5 минут плюс запас. Предел GitHub - 360
+    timeout-minutes: 110    # 11 тактов по 5 минут + публикации больших файлов. Предел GitHub - 360
     steps:
       - uses: actions/checkout@v4
       # Шага установки Python нет: на ubuntu-latest он предустановлен.
@@ -77,7 +77,7 @@ jobs:
       - name: Проверки перед работой
         id: checks
         run: |
-          for m in http google_auth sheets drive telegram instagram vk cloudinary; do
+          for m in http google_auth sheets drive telegram instagram vk cloudinary postmypost platforms dates gate; do
             python3 -m lib.$m
           done
           python3 -m tests.test_tick
@@ -89,6 +89,9 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
+          # 🔴 Группа креаторов: сюда уходит факт «Переснять» (аудит 02.09).
+          # Не задана - узел просто выключен, такт работает.
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           VK_TOKEN: ${{ secrets.VK_TOKEN }}

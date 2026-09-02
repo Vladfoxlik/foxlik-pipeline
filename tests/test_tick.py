@@ -55,6 +55,7 @@ class FakeBot:
     def __init__(self, presses=()):
         self.presses = list(presses)
         self.cards, self.notes, self.locks = [], [], []
+        self.chats = []
         self.confirmed = 0
         self.order = []
 
@@ -73,6 +74,7 @@ class FakeBot:
 
     def notify(self, text, chat_id=None):
         self.notes.append(text)
+        self.chats.append(chat_id)
         return 1
 
     def lock(self, chat_id, message_id, verdict):
@@ -140,6 +142,13 @@ class FakePmp:
         self.posted.append((filename, content, list(account_ids), post_at, черновик,
                             details))
         return 31879606           # id публикации в сервисе, снят живым прогоном 31.08
+
+    def get_publication_posts(self, pub_id):
+        # форма как у lib/postmypost.get_publication_posts (поля - по доке)
+        return [{"account_id": 2248551, "post_status": 1,
+                 "link": "https://www.instagram.com/reel/LIVE%s/" % pub_id},
+                {"account_id": 2248535, "post_status": 1,
+                 "url": "https://vk.com/wall-1_%s" % pub_id}]
 
 
 # Аккаунты сняты живьем 31.08. 🔴 Поле называется `chanel_id` - с одной «n»:
@@ -564,8 +573,11 @@ def selftest():
     # "instagram", import_csv пишет ее же. Свое название развалило бы замер молча.
     площадки = sorted(r["Площадка"] for r in pipe.pubs.rows)
     assert площадки == ["instagram", "vk"], площадки
-    assert all(str(r["Медиа ID"]) == "31879606" for r in pipe.pubs.rows), \
-        "без id публикации сервиса ролик потом не найти"
+    # 🔴 Аудит 02.09: id публикации сервиса - с префиксом pmp: и строкой.
+    # Голое число уезжало в Graph API как «медиа Instagram», получало 400
+    # и спамило владельцу «не снялись метрики» каждый день навсегда.
+    assert all(r["Медиа ID"] == "pmp:31879606" for r in pipe.pubs.rows), \
+        [r["Медиа ID"] for r in pipe.pubs.rows]
     assert all(r["Механика"] == "папа" for r in pipe.pubs.rows), \
         "механика обязана доехать до учета и через сервис тоже"
 
@@ -728,6 +740,109 @@ def selftest():
     assert any("модул" in n.lower() for n in pipe.bot.notes), pipe.bot.notes
     assert sheet.rows[0][T.COL_STATUS] != T.PUBLISHED, \
         "неопубликованное нельзя помечать опубликованным"
+
+    # --- 29б. 🔴 ссылки вышедших постов дотягиваются из сервиса ------------
+    # При создании отложенной публикации ссылки не существует - «Ссылка» в
+    # ПУБЛИКАЦИЯХ оставалась пустой навсегда, и выгрузке CSV не с чем было
+    # связаться (аудит 02.09: петля получала ноль). Такт дотягивает ссылки
+    # вышедших публикаций следующим прогоном.
+    import setup as S30
+    pubs_rows = [{"ID": "W36-01", "Дата": "2026-09-03", "Площадка": "instagram",
+                  "Ссылка": "", "Медиа ID": "pmp:90001"},
+                 {"ID": "W36-01", "Дата": "2026-09-03", "Площадка": "vk",
+                  "Ссылка": "", "Медиа ID": "pmp:90001"}]
+    pipe, sheet = build([], pmp=FakePmp(), accounts=PMP_ACCOUNTS)
+    pipe.pubs = FakeSheet(pubs_rows, header=list(S30.LAYOUT["ПУБЛИКАЦИИ"]))
+    pipe.run()
+    ссылки = {r["Площадка"]: r["Ссылка"] for r in pipe.pubs.rows}
+    assert ссылки["instagram"].startswith("https://www.instagram.com/"), ссылки
+    assert ссылки["vk"].startswith("https://vk.com/"), ссылки
+
+    # === 30. Аудит 02.09: красные дыры публикации ==========================
+
+    # --- 30а. 🔴 отказ ПОСЛЕ создания публикации не рождает двойной эфир ---
+    # Публикация уже в очереди сервиса, а упавший notify/append давал строке
+    # ОШИБКА и владельцу «Не опубликовалось» - он одобрял заново, ролик
+    # выходил дважды. Статус обязан встать сразу после точки невозврата.
+    class ЛомкийБот(FakeBot):
+        def notify(self, text, chat_id=None):
+            raise RuntimeError("telegram недоступен")
+
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-04")])
+    pipe.bot = ЛомкийБот()
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED, \
+        u"отказ уведомления после эфира не должен делать ролик «неопубликованным»: %s" \
+        % sheet.rows[0][T.COL_STATUS]
+    assert len(pipe.ig.posted) == 1
+    pipe.bot = FakeBot()
+    pipe.run()
+    assert len(pipe.ig.posted) == 1, u"второй такт не должен публиковать повторно"
+
+    # --- 30б. 🔴 без единого канала строка НЕ становится ОПУБЛИКОВАН -------
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-04")])
+    pipe.ig = pipe.vk = pipe.cloud = pipe.pmp = None
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.APPROVED, \
+        u"публиковать нечем - строка обязана ждать, а не сгорать: %s" \
+        % sheet.rows[0][T.COL_STATUS]
+    assert any(u"нечем" in n for n in pipe.bot.notes), pipe.bot.notes
+
+    # --- 30в. 🔴 мусорная дата не публикует немедленно и говорит ОДИН раз --
+    pipe, sheet = build([row(status=T.APPROVED, date="05.09")])
+    pipe.run()
+    pipe.run()
+    assert pipe.ig.posted == [], u"нечитаемая дата - не «пора», а «стоп»"
+    assert sheet.rows[0][T.COL_STATUS] == T.APPROVED
+    assert sum(1 for n in pipe.bot.notes if u"не публикуется" in n) == 1, \
+        u"об отложенной строке говорится один раз, не каждый такт: %s" % pipe.bot.notes
+
+    # --- 30г. 🔴 строка без описания не блокирует очередь ------------------
+    r1 = row(status=T.APPROVED, plan=u"P26-01 · без описания", date="2026-09-04",
+             file_="link-a")
+    r2 = row(status=T.APPROVED, plan=u"P26-09 · нормальная", date="2026-09-04",
+             file_="link-b")
+    план = FakeSheet([{"ID": "P26-01", "Механика": u"мама", "Описание к посту": ""},
+                      {"ID": "P26-09", "Механика": u"папа",
+                       "Описание к посту": u"текст поста"}])
+    pipe, sheet = build([r1, r2], plan=план)
+    pipe.run()
+    assert len(pipe.ig.posted) == 1, u"вторая строка обязана выйти в этом же такте"
+    assert sheet.rows[1][T.COL_STATUS] == T.PUBLISHED, sheet.rows[1][T.COL_STATUS]
+    assert any(u"не публикуется" in n for n in pipe.bot.notes), \
+        u"про строку без описания владельцу не сказано: %s" % pipe.bot.notes
+    pipe.run()
+    assert sum(1 for n in pipe.bot.notes if u"не публикуется" in n) == 1, \
+        u"напоминание не должно повторяться каждый такт"
+
+    # --- 30д. 🔴 холостой прогон не публикует запасными ветками ------------
+    # DRY_RUN держался только на Postmypost: при его отвале ig/vk выпускали
+    # «прогон» в настоящий эфир на 415 тыс. подписчиков.
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-04")], вхолостую=True)
+    pipe.run()
+    assert pipe.ig.posted == [], u"холостой прогон ушел в живой Instagram"
+    assert sheet.rows[0][T.COL_STATUS] == T.APPROVED, sheet.rows[0][T.COL_STATUS]
+
+    # --- 30е. 🔴 статус с пробелом или в нижнем регистре жив ----------------
+    # Ручная правка ячейки - штатный путь починки, который бот сам советует.
+    pipe, sheet = build([row(status=u" ОДОБРЕН ", date="2026-09-04")])
+    pipe.run()
+    assert len(pipe.ig.posted) == 1, u"«ОДОБРЕН » с пробелом невидим такту"
+    pipe, sheet = build([row(status=u"публикуется")])
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.FAILED, \
+        u"зависшая строка в нижнем регистре не подобрана"
+
+    # --- 30ж. 🔴 «Переснять» доходит до креаторов --------------------------
+    # Раньше вердикт не оповещал никого, кроме владельца: он думал, что
+    # креатор знает, креатор ждал эфира.
+    r = row(status=T.ON_REVIEW)
+    pipe, sheet = build([r])
+    pipe.group_chat_id = "-100500"
+    pipe.bot.presses = [press(T.Pipeline.row_key(dict(r, _row=2)), action="no")]
+    pipe.run()
+    assert "-100500" in pipe.bot.chats, \
+        u"группа креаторов не оповещена о пересъемке: %s" % pipe.bot.chats
 
     print("tick selftest OK: 29 проверок - полный путь, одна публикация за такт, "
           "идемпотентность, зависшее, сдвиг листа, ошибки, секреты, перевалка, "

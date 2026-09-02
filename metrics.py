@@ -39,13 +39,16 @@ import traceback
 
 import dictionary
 import generator
+from lib import dates
+import datetime as _dt
+dates_MSK = _dt.timezone(_dt.timedelta(hours=3))
 from lib import google_auth, http, instagram, sheets, telegram
 
 SHEET_PUBLICATIONS = "ПУБЛИКАЦИИ"
 SHEET_METRICS = "МЕТРИКИ"
 SHEET_SETTINGS = "НАСТРОЙКИ"
 
-GATE = 1.5          # репостов на 1000 просмотров, порог допуска (ТЗ §3)
+from lib.gate import GATE  # порог допуска - единственный экземпляр (аудит 02.09)
 DAY = 7             # на какой день после публикации снимаем
 TOKEN_WARN_DAYS = 7  # за сколько дней до смерти токена бить тревогу
 
@@ -77,17 +80,7 @@ def read_insights(ig, media_id, metrics):
     return out
 
 
-def per_1000(shares, views):
-    """Репостов на 1000 просмотров. Ноль просмотров - не ноль репостов, а «нечего делить»."""
-    if not views:
-        return None
-    return round(shares * 1000.0 / views, 2)
-
-
-def verdict(rate):
-    if rate is None:
-        return "нет данных"
-    return "залет" if rate >= GATE else ("провал" if rate < 0.5 else "середина")
+from lib.gate import per_1000, verdict  # noqa: F401 - канон один (аудит 02.09)
 
 
 class Metrics:
@@ -99,7 +92,8 @@ class Metrics:
         self.bot = bot
         # книга целиком нужна только для пересчета словаря; в проверках ее нет
         self.book = book
-        self.today = today or datetime.date.today()
+        # 🔴 Аудит 02.09: сегодня - московское, раннер в UTC (см. tick)
+        self.today = today or datetime.datetime.now(dates_MSK).date()
         self.log = []
 
     def say(self, line):
@@ -173,11 +167,24 @@ class Metrics:
     # ---------- замер ----------
 
     def due(self):
-        """Публикации в Instagram старше 7 дней, по которым замера еще не было."""
+        """Публикации в Instagram старше 7 дней, по которым замера еще не было.
+
+        🔴 Аудит 02.09, два исключения:
+        - «Медиа ID» с префиксом pmp: - это id публикации Postmypost, а не
+          медиа Instagram. Graph API отвечает на него 400, строка не
+          помечалась замеренной и спамила владельцу каждый день навсегда.
+          Замер таких роликов приходит из выгрузки CSV (import_csv);
+        - «Соответствие: холостой прогон» - проба не выходила в эфир,
+          мерить нечего.
+        """
         done = {r.get(COL_ID) for r in self.metrics.read()}
         out = []
         for row in self.pubs.read():
             if row.get(COL_PLATFORM) != "instagram" or not row.get(COL_MEDIA):
+                continue
+            if str(row.get(COL_MEDIA) or "").strip().startswith("pmp:"):
+                continue
+            if (row.get("Соответствие") or "").strip() == "холостой прогон":
                 continue
             if row.get(COL_ID) in done:
                 continue
@@ -317,29 +324,10 @@ GOOGLE_EPOCH = datetime.date(1899, 12, 30)   # день 0 в счете Google S
 
 
 def _as_date(value):
-    """Дата из ячейки. Понимает и текст, и серийный номер Google.
-
-    🔴 Найдено холостым прогоном 31.08. Такт пишет «2026-08-31», Google принимает
-    значение как USER_ENTERED и хранит его СВОИМ числом - при чтении приходит
-    «46265». Замер отбирает ролики по дате, неразобранная дата означает «еще
-    не созрел», и ролик не попал бы в замер никогда. В логе при этом честное
-    «замерять нечего»: ошибка полностью молчаливая.
-
-    Число тоже проверяется на разумность: однозначное или двузначное - это
-    чей-то мусор в ячейке, а не 1900 год.
-    """
-    text = str(value or "").strip()[:10]
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
-        try:
-            return datetime.datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
-    if text.isdigit() and len(text) >= 5:
-        try:
-            return GOOGLE_EPOCH + datetime.timedelta(days=int(text))
-        except (ValueError, OverflowError):
-            return None
-    return None
+    """Дата из листа. Единый разбор - lib/dates (аудит 02.09)."""
+    if isinstance(value, datetime.date):
+        return value
+    return dates.as_date(value)
 
 
 def from_env():

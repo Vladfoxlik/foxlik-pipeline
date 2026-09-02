@@ -32,8 +32,8 @@ import re
 import sys
 import traceback
 
-from lib import (cloudinary, drive, google_auth, http, instagram, platforms,
-                 postmypost, sheets, telegram, vk)
+from lib import (cloudinary, dates, drive, google_auth, http, instagram,
+                 platforms, postmypost, sheets, telegram, vk)
 
 # Каналы Postmypost, сняты живьем 31.08 запросом /channels.
 # 🔴 Имена площадок обязаны совпадать с теми, что уже ходят по петле: metrics.py
@@ -113,6 +113,17 @@ PUBLISHING = "ПУБЛИКУЕТСЯ"
 PUBLISHED = "ОПУБЛИКОВАН"
 FAILED = "ОШИБКА"
 
+
+def status_of(row):
+    """Статус строки, нечувствительный к пробелам и регистру.
+
+    🔴 Аудит 02.09: ручная правка ячейки - штатный путь починки, который бот
+    сам советует («поставьте статус ОДОБРЕН заново»). «ОДОБРЕН » с пробелом
+    или «одобрен» были невидимы всем четырем шагам такта - строка молчала
+    вечно, и никто не узнавал.
+    """
+    return (row.get(COL_STATUS) or "").strip().upper()
+
 MAX_MB = 300            # предохранитель: больше в память раннера тянуть незачем
 
 
@@ -147,13 +158,16 @@ AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "
 
 class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
-                 today=None, plan=None, pmp=None, pmp_accounts=(), вхолостую=False):
+                 today=None, plan=None, pmp=None, pmp_accounts=(), вхолостую=False,
+                 group_chat_id=None):
         # 🔴 Холостой прогон (31.08). Цепочка «сдача → приемка → эфир» ни разу
         # не проходила целиком, а проверить ее на живом ролике значит опубликовать
         # его по-настоящему в аккаунт на 415 тыс. подписчиков. В этом режиме все
         # шаги настоящие - файл скачивается, грузится в сервис, публикация
         # создается, - но со статусом «черновик»: в ленту не выходит ничего.
         self.вхолостую = вхолостую
+        # чат группы креаторов: сюда уходит факт пересъемки (аудит 02.09)
+        self.group_chat_id = group_chat_id
         self.bot = bot
         self.sheet = sheet
         self.pubs = pubs
@@ -166,7 +180,10 @@ class Pipeline:
         self.pmp = pmp
         self.pmp_accounts = list(pmp_accounts or ())
         self.plan = plan
-        self.today = today or datetime.date.today()
+        # 🔴 Аудит 02.09: раннер живет в UTC - с 00:00 до 03:00 МСК
+        # date.today() отдавал ВЧЕРА: ночное одобрение уходило в эфир
+        # сразу (окно «вчера» прошло), даты учета съезжали.
+        self.today = today or datetime.datetime.now(MSK).date()
         self.log = []
         self._mechanics = None
         self._captions = {}      # лист ПЛАН читается один раз на такт
@@ -363,6 +380,11 @@ class Pipeline:
     def handle_presses(self, rows):
         presses = self.bot.get_presses()
         if not presses:
+            # 🔴 Аудит 02.09: пакет прочитан - offset обязан сдвинуться, даже
+            # если нажатий в нем нет. Иначе болтовня группы копится в окне
+            # getUpdates (limit=100), и нажатие владельца за краем окна
+            # невидимо до истечения суток.
+            self.bot.confirm()
             return
         for press in presses:
             try:
@@ -371,7 +393,7 @@ class Pipeline:
                 self.bot.notify("⚠️ Нажатие не применено: %s" % e)
                 self.say("нажатие мимо: %s" % e)
                 continue
-            if row[COL_STATUS] not in (ON_REVIEW, ACCEPTED):
+            if status_of(row) not in (ON_REVIEW, ACCEPTED):
                 # повторное нажатие по старой карточке не должно откатывать статус
                 self.say("нажатие по строке %s пропущено: статус уже %s"
                          % (row["_row"], row[COL_STATUS]))
@@ -386,6 +408,19 @@ class Pipeline:
                 self.sheet.set(row["_row"], COL_STATUS, RESHOOT)
                 row[COL_STATUS] = RESHOOT
                 verdict = "🔁 Переснять"
+                # 🔴 Аудит 02.09: вердикт «Переснять» не доходил до креатора
+                # ВООБЩЕ - владелец думал, что тот оповещен, креатор ждал
+                # эфира. Теперь группа получает факт; причину и детали
+                # владелец пишет сам (машина их не знает).
+                if self.group_chat_id:
+                    try:
+                        self.bot.notify(
+                            "🔁 Ролик по строке %s отправлен на пересъемку. "
+                            "Подробности напишет владелец."
+                            % (row.get(COL_PLAN) or row["_row"]),
+                            chat_id=self.group_chat_id)
+                    except Exception:
+                        self.say("группа о пересъемке не оповещена (сбой отправки)")
             self.say("строка %s -> %s" % (row["_row"], row[COL_STATUS]))
             self.bot.lock(press["chat_id"], press["message_id"], verdict)
         # подтверждаем только теперь: упади такт раньше - нажатия дождутся следующего
@@ -395,12 +430,22 @@ class Pipeline:
 
     def offer_new(self, rows):
         for row in rows:
-            if row.get(COL_STATUS, NEW).strip() not in (NEW, ACCEPTED):
+            if status_of(row) not in (NEW, ACCEPTED):
                 continue
             if not row.get(COL_FILE):
                 continue                      # форма еще дописывает строку
+            # 🔴 Аудит 02.09: форма не запрещает сдать одну строку плана
+            # дважды - две карточки, два одобрения, два эфира. Машина не
+            # решает, какая сдача правильная, но обязана предупредить.
+            title = row.get(COL_PLAN) or "без строки плана"
+            key = self.plan_key(row.get(COL_PLAN))
+            if key and any(self.plan_key(r.get(COL_PLAN)) == key
+                           and r.get("_row") != row.get("_row")
+                           and status_of(r) not in (NEW,)
+                           for r in rows):
+                title = "⚠️ ПОВТОРНАЯ СДАЧА " + title
             self.bot.ask_review(row_id=self.row_key(row),
-                                title=row.get(COL_PLAN) or "без строки плана",
+                                title=title,
                                 file_url=row[COL_FILE],
                                 comment=row.get(COL_COMMENT, ""))
             self.sheet.set(row["_row"], COL_STATUS, ON_REVIEW)
@@ -410,17 +455,69 @@ class Pipeline:
     # ---------- шаг 3: публикация ----------
 
     def pick_due(self, rows):
-        """Первая созревшая строка: одобрена и дата подошла. Больше одной не берем."""
+        """Первая созревшая строка: одобрена, дата подошла, описание есть.
+
+        🔴 Аудит 02.09, две дыры одним методом:
+        - нечитаемая непустая дата («05.09» без года) трактовалась как «пора» -
+          опечатка владельца means немедленный эфир. Теперь это «стоп» вслух;
+        - строка без описания возвращалась в ОДОБРЕН и, стоя первой, навсегда
+          блокировала ВСЕ публикации - молча, только строчкой в лог Actions.
+          Теперь она пропускается, очередь идет дальше, владельцу сказано раз.
+        """
+        self._load_plan()
         for row in rows:
-            if row.get(COL_STATUS) != APPROVED:
+            if status_of(row) != APPROVED:
                 continue
-            when = _as_date(row.get(COL_DATE))
+            raw = (row.get(COL_DATE) or "").strip()
+            when = _as_date(raw)
+            if raw and when is None:
+                self._defer(row, "дата публикации не читается: «%s»" % raw)
+                continue
             if when and when > self.today:
+                continue
+            key = self.plan_key(row.get(COL_PLAN))
+            if not (self._captions.get(key) or "").strip():
+                self._defer(row, "в ПЛАНЕ нет описания к посту для «%s»"
+                            % (key or "?"))
                 continue
             return row
         return None
 
+    def _defer(self, row, why):
+        """Отложить строку вслух, но сказать об этом владельцу ОДИН раз.
+
+        Дедуп без памяти между тактами: носитель - колонка «Причина отказа».
+        Совпала с текущей причиной - уже говорили, молчим. Причина ушла
+        (владелец дописал описание/поправил дату) - строка публикуется штатно,
+        а остаток в колонке затирается при успехе.
+        """
+        текст = "отложено: " + why
+        if (row.get(COL_REASON) or "").strip() != текст:
+            self.sheet.set(row["_row"], COL_REASON, текст)
+            row[COL_REASON] = текст
+            self.bot.notify("⏸ Строка %s не публикуется: %s"
+                            % (row.get(COL_PLAN) or row["_row"], why))
+        self.say("строка %s отложена: %s" % (row["_row"], why))
+
     def publish(self, row):
+        # 🔴 Аудит 02.09: публиковать НЕЧЕМ (тариф кончился, токены не заданы,
+        # pmp отвалился) - строка раньше проходила весь цикл и получала
+        # терминальный ОПУБЛИКОВАН с «📤 Опубликовано» владельцу; за ночь так
+        # тихо сгорала вся очередь. Проверка стоит ДО метки и до скачивания.
+        if not self.pmp and not (self.ig and self.cloud) and not self.vk:
+            self.bot.notify("⛔ Публиковать нечем: ни один канал не подключен. "
+                            "Строка %s ждет." % (row.get(COL_PLAN) or row["_row"]))
+            self.say("строка %s: публиковать нечем" % row["_row"])
+            return
+        # 🔴 Аудит 02.09: холостой режим держался только на Postmypost - при
+        # его отвале запасные ветки ig/vk выпускали «прогон» в настоящий эфир.
+        if self.вхолостую and not self.pmp:
+            self.bot.notify("⛔ Холостой прогон возможен только через Postmypost "
+                            "(у прямых веток нет черновиков). Строка %s ждет."
+                            % (row.get(COL_PLAN) or row["_row"]))
+            self.say("строка %s: холостой прогон без Postmypost остановлен"
+                     % row["_row"])
+            return
         # 🔴 первым действием - метка. Она и есть защита от второго запуска.
         self.sheet.set(row["_row"], COL_STATUS, PUBLISHING)
         self.say("строка %s взята в публикацию" % row["_row"])
@@ -476,7 +573,11 @@ class Pipeline:
                 # 🔴 Ссылки на пост в этот момент еще нет: сервис ставит публикацию
                 # в очередь и выдает свой id. По нему пост и находится потом.
                 links[platform] = ""
-                media_ids[platform] = pub_id
+                # 🔴 Аудит 02.09: это id публикации POSTMYPOST, не медиа
+                # Instagram. Префикс отличает его от настоящего: замер Д7
+                # такие строки не берет (ждут выгрузки CSV), а импорт CSV
+                # дозаписывает настоящий id, связавшись по ссылке.
+                media_ids[platform] = "pmp:%s" % pub_id
         elif self.ig and self.cloud:
             public_id, url = self.cloud.upload(name, content)
             try:
@@ -488,6 +589,15 @@ class Pipeline:
                 self.cloud.destroy(public_id)   # перевалка не должна копить файлы
         if self.vk and not self.pmp:
             links["vk"] = self.vk.publish(name, content, name=caption, message=caption)
+
+        # 🔴 ТОЧКА НЕВОЗВРАТА (аудит 02.09). Публикация создана в сервисе -
+        # статус встает СЕЙЧАС, до уведомлений и учета. Раньше он ставился
+        # последним: упавший notify или запись в ПУБЛИКАЦИИ давали строке
+        # ОШИБКА и владельцу «Не опубликовалось» - он одобрял заново, и ролик
+        # выходил в эфир дважды. Учет ниже падает уже НЕ на статус.
+        self.sheet.set(row["_row"], COL_STATUS, PUBLISHED)
+        self.sheet.set(row["_row"], COL_REASON, "")
+        row[COL_STATUS] = PUBLISHED
 
         # 🔴 Ключ, а не сырая строка формы. 31.08 починку сделали только для подписи
         # к посту, а механика и пять осей остались на сыром значении «P1-01 · Спартак ·
@@ -509,41 +619,99 @@ class Pipeline:
                             "Поправьте оси в ПУБЛИКАЦИЯХ до замера на Д7."
                             % (plan_id or "без номера",
                                (row.get(COL_COMMENT) or "").strip() or "без пояснения"))
-        for platform, link in links.items():
-            self.pubs.append({"ID": plan_id,
-                              "Дата": self.today.isoformat(),
-                              "Площадка": platform,
-                              "Ссылка": link,
-                              # 🔴 без него metrics.py не сможет снять замер на Д7:
-                              # insights запрашиваются по идентификатору медиа, не по ссылке
-                              "Медиа ID": media_ids.get(platform, ""),
-                              "Креатор": row.get(COL_EMAIL, ""),
-                              # 🔴 без нее словарь механик пропустит этот ролик,
-                              # и партия не попадет в память петли
-                              "Механика": mechanic,
-                              # 🔴 чему верить в пяти колонках справа: «по сцене» -
-                              # оси описывают кадр, «отступил» и «не подтверждено» -
-                              # только замысел. Словарь считает первые и вслух
-                              # называет, сколько отложил (А9, 29.08)
-                              # 🔴 Холостая строка обязана быть видна в учете:
-                              # иначе проба уедет в словарь механик наравне
-                              # с настоящим роликом и испортит замер приема.
-                              "Соответствие": ("холостой прогон" if self.вхолостую
-                                               else match),
-                              # четыре остальные оси учета (Ш2, 29.08): без них
-                              # словарь считает только по приему
-                              **self.axes_of(plan_id)})
-        self.sheet.set(row["_row"], COL_STATUS, PUBLISHED)
-        self.say("строка %s опубликована: %s" % (row["_row"], ", ".join(links) or "никуда"))
-        self.bot.notify("📤 Опубликовано: %s\n%s" % (
-            row.get(COL_PLAN, ""), "\n".join("%s - %s" % kv for kv in links.items())))
+        # 🔴 Учет и уведомления - ПОСЛЕ точки невозврата и под своим зонтиком:
+        # их отказ не отменяет случившийся эфир и не провоцирует повтор.
+        try:
+            for platform, link in links.items():
+                self.pubs.append({"ID": plan_id,
+                                  "Дата": self.today.isoformat(),
+                                  "Площадка": platform,
+                                  "Ссылка": link,
+                                  # 🔴 без него metrics.py не сможет снять замер на Д7:
+                                  # insights запрашиваются по идентификатору медиа, не по ссылке
+                                  "Медиа ID": media_ids.get(platform, ""),
+                                  "Креатор": row.get(COL_EMAIL, ""),
+                                  # 🔴 без нее словарь механик пропустит этот ролик,
+                                  # и партия не попадет в память петли
+                                  "Механика": mechanic,
+                                  # 🔴 чему верить в пяти колонках справа: «по сцене» -
+                                  # оси описывают кадр, «отступил» и «не подтверждено» -
+                                  # только замысел. Словарь считает первые и вслух
+                                  # называет, сколько отложил (А9, 29.08)
+                                  # 🔴 Холостая строка обязана быть видна в учете:
+                                  # иначе проба уедет в словарь механик наравне
+                                  # с настоящим роликом и испортит замер приема.
+                                  "Соответствие": ("холостой прогон" if self.вхолостую
+                                                   else match),
+                                  # четыре остальные оси учета (Ш2, 29.08): без них
+                                  # словарь считает только по приему
+                                  **self.axes_of(plan_id)})
+            self.say("строка %s опубликована: %s"
+                     % (row["_row"], ", ".join(links) or "черновиком в сервис"))
+            self.bot.notify("📤 Опубликовано: %s\n%s" % (
+                row.get(COL_PLAN, ""), "\n".join("%s - %s" % kv for kv in links.items())))
+        except Exception as e:
+            # эфир состоялся - об этом надо знать, даже если учет захромал
+            self.say("строка %s опубликована, но учет/уведомление не записались: %s"
+                     % (row["_row"], http.mask(str(e))[:200]))
+            try:
+                self.bot.notify("⚠️ Строка %s ОПУБЛИКОВАНА, но не записана в учет "
+                                "(%s). Проверьте лист ПУБЛИКАЦИИ."
+                                % (row.get(COL_PLAN) or row["_row"],
+                                   http.mask(str(e))[:120]))
+            except Exception:
+                pass
         return links
+
+    # ---------- шаг 3б: дотянуть ссылки вышедших постов ----------
+
+    ССЫЛОЧНЫЕ_ПОЛЯ = ("link", "url", "post_url", "permalink")
+
+    def enrich_links(self):
+        """Заполняет пустые «Ссылки» строк pmp: из `GET /publications/{id}`.
+
+        🔴 Аудит 02.09: при создании отложенной публикации ссылки не существует,
+        и «Ссылка» в ПУБЛИКАЦИЯХ оставалась пустой навсегда - выгрузке CSV
+        не с чем связаться, петля получала ноль. Состав полей поста в ответе
+        сервиса снят ПО ДОКЕ, не живьем, поэтому ссылка ищется мягко по
+        нескольким именам; не нашлась - строка молчит до следующего такта.
+        """
+        if not self.pmp:
+            return
+        по_каналам = {a["id"]: CHANNELS.get(a.get("chanel_id"))
+                      for a in self.pmp_accounts}
+        кэш = {}
+        for row in self.pubs.read():
+            media = str(row.get("Медиа ID") or "").strip()
+            if not media.startswith("pmp:") or (row.get("Ссылка") or "").strip():
+                continue
+            when = _as_date(row.get("Дата"))
+            if when and when > self.today:
+                continue          # публикация еще не выходила - ссылки нет
+            pub_id = media[4:]
+            if pub_id not in кэш:
+                try:
+                    кэш[pub_id] = self.pmp.get_publication_posts(pub_id)
+                except Exception as e:
+                    self.say("ссылки публикации %s не дотянулись: %s"
+                             % (pub_id, http.mask(str(e))[:120]))
+                    кэш[pub_id] = []
+            for post in кэш[pub_id]:
+                if по_каналам.get(post.get("account_id")) != row.get("Площадка"):
+                    continue
+                ссылка = next((post[k] for k in self.ССЫЛОЧНЫЕ_ПОЛЯ
+                               if post.get(k)), "")
+                if ссылка:
+                    self.pubs.set(row["_row"], "Ссылка", ссылка)
+                    self.say("строка %s (%s): ссылка дотянута"
+                             % (row.get("ID"), row.get("Площадка")))
+                break
 
     # ---------- шаг 4: зависшее ----------
 
     def rescue_stuck(self, rows):
         for row in rows:
-            if row.get(COL_STATUS) != PUBLISHING:
+            if status_of(row) != PUBLISHING:
                 continue
             self.sheet.set_many(row["_row"], {
                 COL_STATUS: FAILED,
@@ -561,6 +729,10 @@ class Pipeline:
         self.rescue_stuck(rows)       # раньше всего: иначе зависшее увидят как новое
         self.handle_presses(rows)
         self.offer_new(rows)
+        try:
+            self.enrich_links()       # ссылки вышедших постов - для связи с CSV
+        except Exception as e:
+            self.say("дотягивание ссылок упало: %s" % http.mask(str(e))[:120])
         due = self.pick_due(rows)
         if not due:
             self.say("публиковать нечего")
@@ -568,6 +740,18 @@ class Pipeline:
         try:
             self.publish(due)
         except Exception as e:
+            # 🔴 Аудит 02.09: если точка невозврата пройдена, эфир состоялся -
+            # писать ОШИБКА поверх ОПУБЛИКОВАН значит звать владельца одобрить
+            # заново и получить двойной эфир.
+            if status_of(due) == PUBLISHED:
+                self.say("строка %s: сбой после публикации, статус сохранен" % due["_row"])
+                try:
+                    self.bot.notify("⚠️ Строка %s опубликована, но такт упал после "
+                                    "эфира: %s" % (due.get(COL_PLAN, ""),
+                                                   http.mask(str(e))[:300]))
+                except Exception:
+                    pass
+                return self.log
             self.sheet.set_many(due["_row"], {
                 COL_STATUS: FAILED, COL_REASON: http.mask(str(e))[:900]})
             # в публичный лог - только факт; текст ошибки в таблицу и владельцу
@@ -578,23 +762,14 @@ class Pipeline:
 
 
 def _as_date(value):
-    """Дата из таблицы. Google отдает по-разному, поэтому берем что распознаем."""
-    text = str(value or "").strip()[:10]
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
-        try:
-            return datetime.datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
-    # 🔴 Google хранит дату своим числом и возвращает «46265» вместо «2026-08-31»
-    # (найдено холостым прогоном 31.08). Неразобранная дата означает «строка
-    # не созрела» - и она не опубликуется никогда, без единого сообщения.
-    # Пятизначность - защита от мусора: «7» это не 1900 год, а чья-то опечатка.
-    if text.isdigit() and len(text) >= 5:
-        try:
-            return GOOGLE_EPOCH + datetime.timedelta(days=int(text))
-        except (ValueError, OverflowError):
-            return None
-    return None
+    """Дата из таблицы. Единый разбор - lib/dates (аудит 02.09: было пять копий).
+
+    Неразобранная НЕПУСТАЯ дата - это «стоп, скажите вслух», а не «пора»:
+    решает pick_due/_defer. Пустая - «дата не назначена».
+    """
+    if isinstance(value, datetime.date):
+        return value
+    return dates.as_date(value)
 
 
 GOOGLE_EPOCH = datetime.date(1899, 12, 30)   # день 0 в счете Google Sheets
@@ -701,6 +876,7 @@ def from_env():
             print("Postmypost выключен: %s" % e, file=sys.stderr)
             pmp = None
     return Pipeline(
+        group_chat_id=os.environ.get("TELEGRAM_GROUP_ID"),
         bot=telegram.Bot(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_OWNER_ID"]),
         sheet=sheets.Sheet(sa, sid, SHEET_SUBMISSIONS),
         pubs=sheets.Sheet(sa, sid, SHEET_PUBLICATIONS),

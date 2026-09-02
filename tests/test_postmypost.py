@@ -61,6 +61,15 @@ class FakeApi:
             return out
         if path == "/publications":
             return {"data": {"id": 90001}}
+        if path == "/publications/90001":
+            # 🔴 Форма ответа снята по справочнику POSTMYPOST_API.md §5:
+            # GET /publications/{id} отдает posts по объекту на аккаунт
+            # (ЗАМЕРЕНО 31.08, что posts есть; состав полей поста - ПО ДОКЕ).
+            return {"data": {"id": 90001, "posts": [
+                {"account_id": 12, "post_status": 1,
+                 "link": "https://www.instagram.com/reel/LIVE1/"},
+                {"account_id": 11, "post_status": 1,
+                 "url": "https://vk.com/wall-123_45"}]}}
         raise AssertionError("неожиданный вызов " + url)
 
     def post_file(self, url, field, filename, content, extra=None, headers=None,
@@ -174,6 +183,23 @@ def selftest():
     # --- токен не доживает до лога -----------------------------------------
     err = http.HttpError(401, "unauthorized", "https://api.postmypost.io/v4.1/accounts")
     assert "TOKEN" not in str(err)
+
+    # --- Аудит 02.09: черновик и детали доходят до тела запроса живым классом
+    # (раньше это знал только FakePmp из test_tick - последний рубеж холостого
+    # прогона не был проверен на настоящем классе вовсе).
+    api = FakeApi()
+    with_api(api, lambda: client().post_video_bytes(
+        b"x" * 10, "v.mp4", "текст", [11, 12], "2026-09-04T18:07:00+03:00",
+        черновик=True, details=[{"content": "вк"}, {"content": "иг"}]))
+    тело = [b for (m, p_, b) in api.calls if p_ == "/publications"][-1]
+    assert тело["publication_status"] == 4,         "черновик обязан уходить как publication_status=4: %r" % тело
+    assert all(d.get("file_ids") == [778899] for d in тело["details"]),         "file_id обязан подставиться во ВСЕ детали: %r" % тело["details"]
+
+    # --- Аудит 02.09: ссылки вышедшего поста дотягиваются по get_publication
+    api = FakeApi()
+    posts = with_api(api, lambda: client().get_publication_posts(90001))
+    assert posts and posts[0]["link"].startswith("https://www.instagram.com/"), posts
+    assert posts[1]["url"].startswith("https://vk.com/"), posts
 
     print("postmypost selftest OK: file_id против id загрузки, вариант B без complete, "
           "поля хранилища точь-в-точь, тип 4 и статус 5, пустая деталь, стена тарифа")

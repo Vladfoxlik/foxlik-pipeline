@@ -46,6 +46,9 @@ C_LEN = "Длительность (с.)"
 C_LINK = "Постоянная ссылка"
 C_KIND = "Тип публикации"
 C_DATE = "Дата"
+# 🔴 Аудит 02.09: в живой выгрузке колонка «Дата» несет «За всё время» у ВСЕХ
+# строк - настоящая дата лежит здесь, по-американски (MM/DD/YYYY HH:MM).
+C_PUBLISHED = "Время публикации"
 C_VIEWS = "Просмотры"
 C_REACH = "Охват"
 C_SHARES = "Репосты"
@@ -56,6 +59,13 @@ C_SAVED = "Сохранения"
 # В выгрузке лежат и фото, и карусели. Механику мы меряем на роликах:
 # смешать их в одну медиану значит сравнивать несравнимое.
 VIDEO_KINDS = ("видео", "reel", "рил")
+
+
+def _published(value):
+    """Дата публикации из «Время публикации» (MM/DD/YYYY HH:MM) - ISO или пусто."""
+    from lib import dates
+    d = dates.as_date(str(value or "").strip()[:10], us=True)
+    return d.isoformat() if d else ""
 
 
 def _number(value):
@@ -77,10 +87,7 @@ def _number(value):
     return int(number) if number == int(number) else number
 
 
-def per_1000(shares, views):
-    if not views or shares is None:
-        return None
-    return round(shares * 1000.0 / views, 2)
+from lib.gate import per_1000, verdict as _verdict_canon  # noqa: E402
 
 
 def _clean(row):
@@ -110,6 +117,7 @@ def parse(stream):
             "account": (raw.get(C_ACCOUNT) or "").strip(),
             "link": (raw.get(C_LINK) or "").strip(),
             "date": (raw.get(C_DATE) or "").strip(),
+            "published": _published(raw.get(C_PUBLISHED)),
             "descr": (raw.get(C_DESCR) or "").strip(),
             "length": _number(raw.get(C_LEN)),
             "views": views,
@@ -131,13 +139,8 @@ def read_file(path):
 
 
 def _verdict(rate):
-    if rate is None:
-        return ""
-    if rate >= 1.5:
-        return "прошел"
-    if rate < 0.5:
-        return "провал"
-    return "не решено"
+    # 🔴 Аудит 02.09: слова вердикта - канон lib/gate, второй словарь удален.
+    return _verdict_canon(rate)
 
 
 def main_account(rows):
@@ -173,11 +176,15 @@ def load(rows, pubs, metrics, report=False, account=None):
 
     known_pub = {}          # медиа-ID -> строка ПУБЛИКАЦИЙ
     id_by_media = {}        # медиа-ID -> наш ID ролика
+    known_link = {}         # постоянная ссылка -> строка ПУБЛИКАЦИЙ
     for row in pubs.read():
         media = (row.get("Медиа ID") or "").strip()
         if media:
             known_pub[media] = row
             id_by_media[media] = (row.get("ID") or "").strip() or media
+        link = (row.get("Ссылка") or "").strip().rstrip("/")
+        if link:
+            known_link[link] = row
 
     known_met = {}          # наш ID -> строка МЕТРИК
     for row in metrics.read():
@@ -198,9 +205,24 @@ def load(rows, pubs, metrics, report=False, account=None):
 
         our_id = id_by_media.get(media, media)
         if media not in known_pub:
+            # 🔴 Аудит 02.09: конвейер Postmypost пишет «Медиа ID» = pmp:<id>,
+            # а выгрузка несет настоящий id Instagram - по id они не совпадут
+            # НИКОГДА, и каждый ролик конвейера плодил двойника без механики:
+            # словарь получал ноль. Запасная связь - постоянная ссылка поста
+            # (заявлена в шапке модуля с 28.08, написана только сейчас).
+            наш = known_link.get((item.get("link") or "").strip().rstrip("/"))
+            if наш is not None:
+                our_id = (наш.get("ID") or "").strip() or media
+                known_pub[media] = наш
+                id_by_media[media] = our_id
+                # настоящий id дозаписывается: дальше связь пойдет по нему
+                if "_row" in наш and hasattr(pubs, "set"):
+                    pubs.set(наш["_row"], "Медиа ID", media)
+                наш["Медиа ID"] = media
+        if media not in known_pub:
             # 🔴 Механика пустая намеренно: ее ставит человек. Импорт не угадывает.
             pubs.append({"ID": our_id,
-                         "Дата": item["date"],
+                         "Дата": item.get("published") or item["date"],
                          "Площадка": "instagram",
                          "Ссылка": item["link"],
                          "Медиа ID": media,

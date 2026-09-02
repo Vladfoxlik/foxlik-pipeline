@@ -137,6 +137,11 @@ def form_options(plan):
     """
     out = []
     for row in plan:
+        # 🔴 Аудит 02.09: «Статус=ЧЕРНОВИК» обещан схемой как гейт, но не
+        # фильтровался нигде - черновики генератора уехали бы в форму, и
+        # креатор снял бы то, чего владелец не утверждал.
+        if "ЧЕРНОВИК" in str(row.get("Статус") or "").upper():
+            continue
         hook = (row.get("Хук") or row.get("Что в кадре") or "").strip()
         if len(hook) > 60:
             hook = hook[:57].rstrip() + "..."
@@ -190,6 +195,21 @@ def do_plan(path):
           % (len(plan), added, len(plan) - added))
 
 
+def _differs(a, b):
+    """Разные ли значения. Даты сравниваются датами, не строками.
+
+    🔴 Аудит 02.09: лист отдает «Дата в эфир» серийным числом Google
+    («46269»), файл несет «2026-09-04» - plan_diff кричал «разошлись: 14
+    из 14» на каждой сверке, и настоящая тревога утонула бы в этом шуме.
+    """
+    x, y = (a or ""), (b or "")
+    if str(x).strip() == str(y).strip():
+        return False
+    from lib import dates
+    dx, dy = dates.as_date(x), dates.as_date(y)
+    return not (dx and dy and dx == dy)
+
+
 def plan_diff(файл, таблица):
     u"""Чем файл плана отличается от того, что лежит в листе.
 
@@ -206,7 +226,7 @@ def plan_diff(файл, таблица):
         if было is None:
             continue
         # сверяем только колонки файла: в листе есть служебные (Статус выдачи)
-        if any((строка.get(k) or "") != (было.get(k) or "") for k in строка):
+        if any(_differs(строка.get(k), было.get(k)) for k in строка):
             разошлись.append(ident)
     return {"новые": sorted(i for i in в_файле if i not in в_листе),
             "лишние": sorted(i for i in в_листе if i not in в_файле),

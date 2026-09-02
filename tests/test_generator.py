@@ -390,3 +390,24 @@ def selftest_fixes():
 if __name__ == "__main__":
     selftest()
     selftest_fixes()
+
+
+def test_audit_0209():
+    u"""Аудит 02.09: генератор обязан принимать живой план W-нумерации и даты Google."""
+    import datetime
+    assert G._as_date("46269") == datetime.date(2026, 9, 4), \
+        u"серийная дата Google обязана читаться - лист отдает ее так"
+    # W-нумерация недельного потока (принята 02.09) - не «чужой» ID
+    план = [{"ID": "W36-%02d" % i, "Механика": u"папа",
+             "Дата в эфир": "2026-09-%02d" % (4 + i // 2),
+             "Репосты/1000": ""} for i in range(1, 15)]
+    ids = [r["ID"] for r in план]
+    import re as _re
+    assert all(_re.match(G.PLAN_ID_RE, i) for i in ids), \
+        u"живые W36-ID бракуются шаблоном - петля не предложит партию"
+    print("generator audit OK: W-нумерация и серийные даты приняты")
+
+
+if __name__ == "__main__":
+    selftest()
+    test_audit_0209()

@@ -154,6 +154,19 @@ class Postmypost:
             raise PublishError("публикация не создана: %s" % r)
         return pid
 
+    def get_publication_posts(self, pub_id):
+        """Посты публикации по аккаунтам - `GET /publications/{id}` → `posts`.
+
+        🔴 Единственный способ узнать, вышла ли публикация и где она живет:
+        при создании сервис возвращает только свой id, ссылки еще нет
+        (справочник §5, наличие posts ЗАМЕРЕНО 31.08). Состав полей поста
+        снят ПО ДОКЕ, не живьем, - поэтому вызывающий ищет ссылку мягко,
+        по нескольким именам, и молчит, если ее нет.
+        """
+        r = self._call("/publications/%s" % pub_id) or {}
+        data = r.get("data") if isinstance(r.get("data"), dict) else r
+        return list((data or {}).get("posts") or [])
+
     def post_video_url(self, video_url, content, account_ids, post_at):
         """Весь путь для ролика, доступного по ссылке. Возвращает id публикации."""
         file_id = self.upload_from_url(video_url)

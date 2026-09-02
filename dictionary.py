@@ -60,6 +60,9 @@ COL_MECHANIC = "Механика"
 COL_MATCH = "Соответствие"
 MATCH_TRUSTED = ("по сцене", "сверено")   # «сверено» ставит владелец, поправив оси
 MATCH_OFF = "отступил"
+# 🔴 Аудит 02.09: холостая проба конвейера не выходила в эфир - применением
+# приема она считаться не может, как и отступивший ролик.
+MATCH_DRY = "холостой прогон"
 COL_COUNT = "Применений"
 COL_MEDIAN = "Медиана репостов/1000"
 COL_SUBS = "Подписки"
@@ -113,6 +116,23 @@ AXES = ("Механика", "Тема", "Товар", "Ценность", "Ти�
         "Роль товара", "Ситуация")
 
 
+def _canon_axis(axis, value):
+    """Значение оси к канону. Пока канон нужен одной оси - «Теме».
+
+    🔴 Аудит 02.09: ручной план пишет «А1 гаджет-вина», генератор - голый
+    код «А1». Словарь считал один заход двумя ведрами по половинке
+    применений. Канон - код захода: он короткий, стабильный и есть в обоих
+    форматах первым словом.
+    """
+    import re as _re
+    text = (value or "").strip()
+    if axis == "Тема" and text:
+        first = text.split()[0]
+        if _re.match(r"^[А-ЯA-Z]\d+$", first):
+            return first
+    return text
+
+
 def build(publications, measurements, axis=COL_MECHANIC):
     """Собирает словарь: {значение оси: {применений, медиана, подписки, ...}}.
 
@@ -141,12 +161,12 @@ def build(publications, measurements, axis=COL_MECHANIC):
         # 🔴 Отступивший ролик выбрасываем ДО счета, а не помечаем после:
         # иначе он войдет и в медиану, и в базу, и в подписки.
         отметка = (row.get(COL_MATCH) or "").strip().lower()
-        if отметка == MATCH_OFF:
+        if отметка in (MATCH_OFF, MATCH_DRY):
             отступили.add(vid)
             continue
         if COL_MATCH in row and отметка not in MATCH_TRUSTED:
             без_отметки.add(vid)
-        video[vid] = {"механика": (row.get(axis) or "").strip(),
+        video[vid] = {"механика": _canon_axis(axis, row.get(axis)),
                       "дата": (row.get("Дата") or "").strip()}
 
     measured = {}
@@ -245,13 +265,11 @@ def _as_date(text):
     не должна притворяться самой ранней.
     """
     import datetime
-    text = (text or "").strip()
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d"):
-        try:
-            return datetime.datetime.strptime(text[:10], fmt).date()
-        except ValueError:
-            continue
-    return datetime.date.max
+    # 🔴 Аудит 02.09: серийные даты Google уезжали в date.max и молча ломали
+    # хронологию выгорания. Единый разбор - lib/dates; нераспознанное
+    # по-прежнему в конец, а не в начало.
+    from lib import dates as _dates
+    return _dates.as_date(text) or datetime.date.max
 
 
 def _win_status(group_median, base, subs_per_video, subs_base):
