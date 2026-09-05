@@ -65,6 +65,9 @@ COL_PLAN = "Строка плана"
 # идентификатор строки: первая живая публикация 04.09 вышла бы с «P1-01»
 # в тексте. Колонки не существовало вовсе - ревизия процесса нашла.
 COL_CAPTION = "Описание к посту"
+# 🔴 Колонка листа ПЛАН, а не СДАЧ: день, на который строка поставлена в эфир.
+# Имя снято с живого листа 05.09 - «Дата в эфир», не «Дата публикации».
+COL_PLAN_DATE = "Дата в эфир"
 COL_FILE = "Файл"
 COL_COMMENT = "Комментарий"
 COL_STATUS = "Статус"
@@ -113,6 +116,16 @@ PUBLISHING = "ПУБЛИКУЕТСЯ"
 PUBLISHED = "ОПУБЛИКОВАН"
 FAILED = "ОШИБКА"
 
+# 🔴 Метка строки учета, которой эфира не досталось: площадка была отключена
+# от сервиса в момент публикации. Ставится в «Медиа ID» вместо `pmp:<id>` -
+# так замер Д7 ее не возьмет (он ищет настоящий идентификатор), а досыл найдет
+# по одному слову. Пустое поле для этого не годится: пустым оно бывает и у
+# нормальной строки, пока сервис не отдал ссылку.
+PENDING = "ЖДЕТ ДОСЫЛА"
+
+# Код поста в ответе сервиса: 3 - ошибка (справочник POSTMYPOST_API §5).
+POST_FAILED = 3
+
 
 def status_of(row):
     """Статус строки, нечувствительный к пробелам и регистру.
@@ -158,8 +171,8 @@ AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "
 
 class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
-                 today=None, plan=None, pmp=None, pmp_accounts=(), вхолостую=False,
-                 group_chat_id=None):
+                 today=None, plan=None, pmp=None, pmp_accounts=(), pmp_offline=(),
+                 вхолостую=False, group_chat_id=None):
         # 🔴 Холостой прогон (31.08). Цепочка «сдача → приемка → эфир» ни разу
         # не проходила целиком, а проверить ее на живом ролике значит опубликовать
         # его по-настоящему в аккаунт на 415 тыс. подписчиков. В этом режиме все
@@ -179,6 +192,12 @@ class Pipeline:
         # Иначе один ролик уйдет в эфир дважды - и второй раз уже не отозвать.
         self.pmp = pmp
         self.pmp_accounts = list(pmp_accounts or ())
+        # 🔴 Отвалившиеся площадки (05.09). Аккаунт можно отключить в сервисе или
+        # потерять по истекшему доступу, и такт тогда публикует в остаток молча -
+        # ролик выходит в одну сеть вместо двух, и через неделю уже не сказать,
+        # что именно недосняло эфир. Случай: Instagram на 415 тыс. подписчиков
+        # отвалился 04.09, ВК вышел, а выглядело это как «не вышло ничего».
+        self.pmp_offline = list(pmp_offline or ())
         self.plan = plan
         # 🔴 Аудит 02.09: раннер живет в UTC - с 00:00 до 03:00 МСК
         # date.today() отдавал ВЧЕРА: ночное одобрение уходило в эфир
@@ -237,6 +256,23 @@ class Pipeline:
         plan_id = (plan_id or "").strip()
         self._load_plan()
         return self._mechanics.get(plan_id, "")
+
+    def air_date_of(self, plan_id):
+        """День эфира строки: из ПЛАНА, а не из дня, когда нажали кнопку.
+
+        🔴 Замер 05.09: креатор сдал три ролика разом, владелец одобрил их
+        пачкой - и все три получили один день. В ленте они встали бы друг
+        другу на голову и поделили раздачу, а сравнить их между собой стало
+        бы нельзя. У каждой строки плана свой день, одобрение его не меняет.
+
+        Плановый день в прошлом (сдали с опозданием) - выпускаем сегодня:
+        в прошлое публиковать нечем, а держать готовый ролик незачем.
+        """
+        self._load_plan()
+        план = self._air_dates.get(plan_id)
+        if план and план > self.today:
+            return план.isoformat()
+        return self.today.isoformat()
 
     def product_of(self, plan_id):
         """Название товара этой строки плана - ключ к артикулам и ссылкам."""
@@ -304,6 +340,7 @@ class Pipeline:
             return
         self._mechanics, self._axes, self._captions = {}, {}, {}
         self._slots = {}
+        self._air_dates = {}    # ID -> плановый день эфира (колонка «Дата в эфир»)
         if self.plan is not None:
             try:
                 строки_плана = self.plan.read()
@@ -314,6 +351,9 @@ class Pipeline:
                         continue
                     self._mechanics[key] = (row.get("Механика") or "").strip()
                     self._captions[key] = (row.get(COL_CAPTION) or "").strip()
+                    день = _as_date(row.get(COL_PLAN_DATE))
+                    if день:
+                        self._air_dates[key] = день
                     # Оси кроме механики: пустые не пишем, чтобы в ПУБЛИКАЦИЯХ
                     # не появлялись колонки-пустышки на старых планах.
                     self._axes[key] = dict(
@@ -401,7 +441,8 @@ class Pipeline:
             if press["action"] == "ok":
                 self.sheet.set_many(row["_row"], {
                     COL_STATUS: APPROVED,
-                    COL_DATE: row.get(COL_DATE) or self.today.isoformat()})
+                    COL_DATE: row.get(COL_DATE) or self.air_date_of(
+                        self.plan_key(row.get(COL_PLAN)))})
                 row[COL_STATUS] = APPROVED
                 verdict = "✅ Годен"
             else:
@@ -646,6 +687,30 @@ class Pipeline:
                                   # четыре остальные оси учета (Ш2, 29.08): без них
                                   # словарь считает только по приему
                                   **self.axes_of(plan_id)})
+            # 🔴 Сети, которых в эфире не было: аккаунт отключен от сервиса.
+            # Строка пишется ТА ЖЕ, что у вышедших, - с теми же осями и тем же
+            # номером плана, - иначе досыл не найдет, что именно отправлять,
+            # а замер увидит ролик вышедшим везде.
+            for account in self.pmp_offline:
+                platform = CHANNELS.get(account.get("chanel_id"), "площадка %s"
+                                        % account.get("chanel_id"))
+                self.pubs.append({"ID": plan_id,
+                                  "Дата": self.today.isoformat(),
+                                  "Площадка": platform,
+                                  "Ссылка": "",
+                                  "Медиа ID": PENDING,
+                                  "Креатор": row.get(COL_EMAIL, ""),
+                                  "Механика": mechanic,
+                                  "Соответствие": ("холостой прогон" if self.вхолостую
+                                                   else match),
+                                  **self.axes_of(plan_id)})
+            if self.pmp_offline:
+                сети = ", ".join(CHANNELS.get(a.get("chanel_id"), "?")
+                                 for a in self.pmp_offline)
+                self.bot.notify("⚠️ %s: ролик вышел не везде.\nНе подключены к "
+                                "сервису: %s - эти сети ждут досыла.\nПодключите "
+                                "аккаунт в кабинете Postmypost, дальше досыл "
+                                "командой resend." % (plan_id or "без номера", сети))
             self.say("строка %s опубликована: %s"
                      % (row["_row"], ", ".join(links) or "черновиком в сервис"))
             self.bot.notify("📤 Опубликовано: %s\n%s" % (
@@ -678,8 +743,11 @@ class Pipeline:
         """
         if not self.pmp:
             return
+        # 🔴 Отвалившиеся аккаунты тоже в карте: их посты надо УЗНАВАТЬ, чтобы
+        # пометить упавшими. Иначе строка отключенной площадки не сматчится
+        # ни с чем и промолчит.
         по_каналам = {a["id"]: CHANNELS.get(a.get("chanel_id"))
-                      for a in self.pmp_accounts}
+                      for a in list(self.pmp_accounts) + list(self.pmp_offline)}
         кэш = {}
         for row in self.pubs.read():
             media = str(row.get("Медиа ID") or "").strip()
@@ -699,6 +767,18 @@ class Pipeline:
             for post in кэш[pub_id]:
                 if по_каналам.get(post.get("account_id")) != row.get("Площадка"):
                     continue
+                # 🔴 Сервис принял публикацию, но пост не вышел (случай 04.09,
+                # Instagram). Ссылки не будет никогда, и без пометки строка
+                # осталась бы вечно «ждущей ссылку», а ролик - считался вышедшим.
+                if post.get("post_status") == POST_FAILED:
+                    self.pubs.set(row["_row"], "Медиа ID", PENDING)
+                    self.say("строка %s (%s): пост не вышел, поставлен в досыл"
+                             % (row.get("ID"), row.get("Площадка")))
+                    self.bot.notify("⚠️ «%s» не вышел в %s - сервис вернул ошибку "
+                                    "поста. Ролик поставлен в очередь досыла."
+                                    % (row.get("ID") or "без номера",
+                                       row.get("Площадка")))
+                    break
                 ссылка = next((post[k] for k in self.ССЫЛОЧНЫЕ_ПОЛЯ
                                if post.get(k)), "")
                 if ссылка:
@@ -724,6 +804,78 @@ class Pipeline:
 
     # ---------- такт целиком ----------
 
+    def resend(self, rows):
+        """Досыл роликов в площадку, которая в день эфира была отключена.
+
+        🔴 Пара к отметке PENDING. Ролик, не вышедший в главный канал, - это
+        не «пропущенный день», а потерянный ролик: креатор его снял, владелец
+        одобрил, а увидели его 10 тыс. подписчиков ВК вместо 415 тыс. Instagram.
+
+        🔴 Досылается РОВНО ОДИН за день на площадку, самый старый. Пачка за
+        неделю, вываленная разом, сжигает сама себя: раздача делит показы между
+        своими же роликами, и семь штук в один час дадут меньше, чем семь дней
+        по одному. Признак «сегодня уже был эфир» берется из учета, а не из
+        памяти такта: такт бежит много раз в день и памяти между запусками не имеет.
+        """
+        if not self.pmp or not self.pmp_accounts:
+            return
+        self._load_plan()       # подписи и оси нужны и досылу, не только эфиру
+        подключено = {}
+        for a in self.pmp_accounts:
+            подключено[CHANNELS.get(a.get("chanel_id"), "площадка %s"
+                                    % a.get("chanel_id"))] = a
+        try:
+            учет = self.pubs.read()
+        except Exception as e:
+            self.say("досыл не прочитал ПУБЛИКАЦИИ: %s" % http.mask(str(e))[:120])
+            return
+        сегодня = self.today.isoformat()
+        # 🔴 Дата в учете приходит числом Google (замер живого листа 05.09: 46269),
+        # а не текстом. Сравнивать и сортировать сырое значение нельзя - разбираем.
+        занято = set(str(p.get("Площадка") or "") for p in учет
+                     if _as_date(p.get("Дата")) == self.today
+                     and str(p.get("Медиа ID") or "").strip() != PENDING)
+        ждут = [p for p in учет
+                if str(p.get("Медиа ID") or "").strip() == PENDING
+                and p.get("Площадка") in подключено
+                and p.get("Площадка") not in занято]
+        if not ждут:
+            return
+        ждут.sort(key=lambda p: (_as_date(p.get("Дата")) or datetime.date.min,
+                                 p.get("_row") or 0))
+        цель = ждут[0]
+        plan_id = str(цель.get("ID") or "").strip()
+        площадка = цель.get("Площадка")
+        # Файл живет в сдаче, а не в учете: ищем ту же строку плана.
+        сдача = None
+        for r in rows:
+            if self.plan_key(r.get(COL_PLAN)) == plan_id and r.get(COL_FILE):
+                сдача = r
+                break
+        if сдача is None:
+            self.say("досыл %s в %s: сдача с файлом не найдена" % (plan_id, площадка))
+            return
+        caption = self._captions.get(plan_id, "")
+        if not caption:
+            self.say("досыл %s: в ПЛАНЕ нет описания к посту" % plan_id)
+            return
+        аккаунт = подключено[площадка]
+        name, content = self.disk.fetch(сдача[COL_FILE], max_mb=MAX_MB)
+        детали = platforms.details(
+            [аккаунт], caption, артикул=self.article_of(plan_id), file_ids=[0],
+            rules=self.platform_rules(), ozon=self.article_of(plan_id, "Ozon"),
+            links=self.links(), товар=self.product_of(plan_id))
+        pub_id = self.pmp.post_video_bytes(
+            content, name, caption, [аккаунт["id"]],
+            post_at_for(self.today), черновик=self.вхолостую, details=детали)
+        # 🔴 Дата переписывается на сегодняшнюю: у этой строки эфир СЕГОДНЯ,
+        # и замер Д7 считается от него, а не от дня, когда вышел ВК.
+        self.pubs.set_many(цель["_row"], {"Медиа ID": "pmp:%s" % pub_id,
+                                          "Дата": сегодня})
+        self.say("досыл %s в %s: отправлен" % (plan_id, площадка))
+        self.bot.notify("📤 Досыл: «%s» ушел в %s - он ждал с %s."
+                        % (plan_id, площадка, цель.get("Дата") or "?"))
+
     def run(self):
         rows = self.sheet.read()
         self.rescue_stuck(rows)       # раньше всего: иначе зависшее увидят как новое
@@ -733,6 +885,12 @@ class Pipeline:
             self.enrich_links()       # ссылки вышедших постов - для связи с CSV
         except Exception as e:
             self.say("дотягивание ссылок упало: %s" % http.mask(str(e))[:120])
+        # 🔴 Досыл идет ПОД СВОИМ зонтиком и до выбора свежей строки: его отказ
+        # не имеет права отменить сегодняшний эфир, ради которого такт и бежит.
+        try:
+            self.resend(rows)
+        except Exception as e:
+            self.say("досыл упал: %s" % http.mask(str(e))[:120])
         due = self.pick_due(rows)
         if not due:
             self.say("публиковать нечего")
@@ -864,13 +1022,17 @@ def from_env():
     # 🔴 Postmypost старше своих токенов (решение владельца 29.08). Список аккаунтов
     # спрашивается у сервиса, а не хранится у нас: подключить площадку можно в его
     # кабинете в любой момент, и захардкоженный список молча отстал бы от жизни.
-    pmp, pmp_accounts = None, []
+    pmp, pmp_accounts, pmp_offline = None, [], []
     if os.environ.get("POSTMYPOST_TOKEN"):
         pmp = postmypost.Postmypost(os.environ["POSTMYPOST_TOKEN"],
                                     os.environ.get("POSTMYPOST_PROJECT_ID", 358244))
         try:
-            pmp_accounts = [a for a in pmp.accounts()
-                            if a.get("connection_status") == 1]
+            все = pmp.accounts()
+            pmp_accounts = [a for a in все if a.get("connection_status") == 1]
+            # 🔴 Отключенный аккаунт - не «его нет», а «сегодня он не в эфире».
+            # Разница видна только сравнением полного списка с рабочим, и без
+            # нее потеря канала проходит молча (случай 04.09, Instagram).
+            pmp_offline = [a for a in все if a.get("connection_status") != 1]
         except postmypost.TariffError as e:
             # публиковать нечем - но такт обязан доработать: приемка и сдачи живут
             print("Postmypost выключен: %s" % e, file=sys.stderr)
@@ -884,7 +1046,7 @@ def from_env():
         # уходит в учет обезличенным и выпадает из памяти петли.
         plan=sheets.Sheet(sa, sid, SHEET_PLAN),
         disk=drive.Drive(sa), ig=ig, vkontakte=vkontakte, cloud=cloud,
-        pmp=pmp, pmp_accounts=pmp_accounts,
+        pmp=pmp, pmp_accounts=pmp_accounts, pmp_offline=pmp_offline,
         # 🔴 Холостой прогон включается переменной среды, а не флагом командной
         # строки: такт запускается из расписания, где аргументы не передашь.
         вхолостую=bool(os.environ.get("DRY_RUN")))

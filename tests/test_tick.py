@@ -134,6 +134,7 @@ class FakePmp:
     def __init__(self, fail=None):
         self.fail = fail
         self.posted = []          # (имя файла, подпись, аккаунты, время)
+        self.posts = None         # чем ответит get_publication_posts, если задано
 
     def post_video_bytes(self, content_bytes, filename, content, account_ids, post_at,
                          черновик=False, details=None):
@@ -144,6 +145,8 @@ class FakePmp:
         return 31879606           # id публикации в сервисе, снят живым прогоном 31.08
 
     def get_publication_posts(self, pub_id):
+        if self.posts is not None:
+            return self.posts
         # форма как у lib/postmypost.get_publication_posts (поля - по доке)
         return [{"account_id": 2248551, "post_status": 1,
                  "link": "https://www.instagram.com/reel/LIVE%s/" % pub_id},
@@ -165,7 +168,7 @@ def row(status="", plan="P26-09 · папа собирает столик", date
 
 
 def build(rows, presses=(), ig=None, disk=None, today=TODAY, plan=False,
-          pmp=None, accounts=(), вхолостую=False):
+          pmp=None, accounts=(), offline=(), pubs_rows=None, вхолостую=False):
     sheet = FakeSheet(rows)
     if plan is False:
         # 🔴 С 31.08 такт берет подпись к посту из листа ПЛАН и без нее публикацию
@@ -185,10 +188,12 @@ def build(rows, presses=(), ig=None, disk=None, today=TODAY, plan=False,
     # в жизни создан по ней, и колонка, которой там нет, молча пропадает.
     import setup as S
     pipe = T.Pipeline(bot=FakeBot(presses), sheet=sheet,
-                      pubs=FakeSheet([], header=list(S.LAYOUT["ПУБЛИКАЦИИ"])),
+                      pubs=FakeSheet(list(pubs_rows or []),
+                                     header=list(S.LAYOUT["ПУБЛИКАЦИИ"])),
                       disk=disk or FakeDrive(), ig=ig if ig is not None else FakeIG(),
                       vkontakte=FakeVK(), cloud=FakeCloud(), today=today, plan=plan,
-                      pmp=pmp, pmp_accounts=accounts, вхолостую=вхолостую)
+                      pmp=pmp, pmp_accounts=accounts, pmp_offline=offline,
+                      вхолостую=вхолостую)
     return pipe, sheet
 
 
@@ -844,11 +849,134 @@ def selftest():
     assert "-100500" in pipe.bot.chats, \
         u"группа креаторов не оповещена о пересъемке: %s" % pipe.bot.chats
 
-    print("tick selftest OK: 29 проверок - полный путь, одна публикация за такт, "
+    # --- 31. 🔴 отвалившаяся площадка попадает в учет и слышна -------------
+    # Случай 05.09: Instagram отключился от сервиса, такт опубликовал в один ВК
+    # и промолчал. Владелец решил, что не вышло ничего, а на деле потерялся
+    # главный канал на 415 тыс. подписчиков - и узнать, что досылать, было не по чему.
+    r = row(status=T.APPROVED, date="2026-09-04")
+    pipe, sheet = build([r], pmp=FakePmp(), accounts=PMP_ACCOUNTS[:1],
+                        offline=PMP_ACCOUNTS[1:])
+    pipe.run()
+    сети = dict((p.get("Площадка"), p) for p in pipe.pubs.rows)
+    assert "vk" in сети, u"подключенная сеть обязана публиковаться как обычно"
+    assert "instagram" in сети, \
+        u"пропущенная сеть обязана попасть в учет, иначе досылать нечего: %s" % list(сети)
+    assert сети["instagram"]["Медиа ID"] == T.PENDING, \
+        u"строка досыла помечается особо, чтобы замер Д7 ее не взял: %r" \
+        % сети["instagram"]["Медиа ID"]
+    assert any(u"instagram" in n.lower() for n in pipe.bot.notes), \
+        u"владелец не узнал, что канал отвалился: %s" % pipe.bot.notes
+
+    # --- 32. 🔴 вернувшаяся площадка получает накопленное, по одному ролику --
+    # Пара к проверке 31: отметка «ЖДЕТ ДОСЫЛА» бесполезна, если ее никто не
+    # разбирает. Досылается САМЫЙ СТАРЫЙ и ровно один: вывалить в ленту пачку
+    # за неделю значит сжечь их все - раздача делит показы между своими же.
+    сдачи = [row(status=T.PUBLISHED, plan="W36-03 · Ксения · стол", file_="f3"),
+             row(status=T.PUBLISHED, plan="W36-05 · Ксения · песочница", file_="f5")]
+    pipe, sheet = build(сдачи, pmp=FakePmp(), accounts=PMP_ACCOUNTS,
+                        pubs_rows=[{"ID": "W36-05", "Дата": "2026-09-03",
+                                    "Площадка": "instagram", "Ссылка": "",
+                                    "Медиа ID": T.PENDING},
+                                   {"ID": "W36-03", "Дата": "2026-09-02",
+                                    "Площадка": "instagram", "Ссылка": "",
+                                    "Медиа ID": T.PENDING}])
+    pipe.run()
+    досланные = [p for p in pipe.pubs.rows
+                 if str(p.get("Медиа ID", "")).startswith("pmp:")]
+    assert len(досланные) == 1, \
+        u"за такт досылается ровно один ролик, а не пачка: %d" % len(досланные)
+    assert досланные[0]["ID"] == "W36-03", \
+        u"досылать надо самый старый, а ушел %s" % досланные[0]["ID"]
+    assert досланные[0]["Дата"] == TODAY.isoformat(), \
+        u"у досланного эфир сегодня - от этой даты считается замер Д7: %s" \
+        % досланные[0]["Дата"]
+    assert pipe.pmp.posted, u"файл не ушел в сервис вовсе"
+    assert pipe.pmp.posted[-1][2] == [2248551], \
+        u"досыл идет только в вернувшуюся площадку: %s" % (pipe.pmp.posted[-1][2],)
+
+    # --- 32б. 🔴 пока площадка отключена, досыл не пытается и не шумит -------
+    pipe, sheet = build(сдачи, pmp=FakePmp(), accounts=PMP_ACCOUNTS[:1],
+                        offline=PMP_ACCOUNTS[1:],
+                        pubs_rows=[{"ID": "W36-03", "Дата": "2026-09-02",
+                                    "Площадка": "instagram", "Ссылка": "",
+                                    "Медиа ID": T.PENDING}])
+    pipe.run()
+    assert not pipe.pmp.posted, u"в отключенную площадку досылать нечем"
+
+    # --- 34. 🔴 день эфира берется из ПЛАНА, а не из дня одобрения ----------
+    # Замер 05.09: креатор сдал три ролика разом, владелец одобрил их одной
+    # пачкой - и все три получили сегодняшнюю дату, то есть вышли бы в один
+    # вечер друг у друга на голове. Разводить пришлось руками. План на то
+    # и план: у каждой строки есть свой день, и одобрение его не отменяет.
+    r = row(status=T.ON_REVIEW, plan="W36-05 · Ксения · песочница")
+    планы = [{"ID": "W36-05", "Механика": "мама", "Описание к посту": "текст",
+              "Дата в эфир": "2026-09-06"}]
+    pipe, sheet = build([r], plan=FakeSheet(планы))
+    pipe.bot.presses = [press(T.Pipeline.row_key(dict(r, _row=2)))]
+    pipe.run()
+    assert sheet.rows[0][T.COL_DATE] == "2026-09-06", \
+        u"день эфира обязан прийти из плана, а стоит %r" % sheet.rows[0][T.COL_DATE]
+    assert not pipe.pmp or not pipe.pmp.posted, u"будущая строка не публикуется сегодня"
+
+    # --- 34б. 🔴 плановый день уже прошел - выпускаем сегодня, не в прошлое --
+    # Ролик, сданный с опозданием, обязан выйти, а не застрять навсегда.
+    r = row(status=T.ON_REVIEW, plan="W36-01 · Ксения · стол")
+    планы = [{"ID": "W36-01", "Механика": "мама", "Описание к посту": "текст",
+              "Дата в эфир": "2026-09-01"}]
+    pipe, sheet = build([r], plan=FakeSheet(планы))
+    pipe.bot.presses = [press(T.Pipeline.row_key(dict(r, _row=2)))]
+    pipe.run()
+    assert sheet.rows[0][T.COL_DATE] == TODAY.isoformat(), \
+        u"просроченная строка выходит сегодня, а стоит %r" % sheet.rows[0][T.COL_DATE]
+
+    # --- 32в. 🔴 дата в учете приходит числом Google, а не текстом -----------
+    # Замер 05.09 живого листа ПУБЛИКАЦИИ: в колонке «Дата» стоит 46269, а не
+    # «2026-09-04». Сравнение строк тут молча не совпадает ни с чем, и такт
+    # досылал бы второй ролик в тот же день поверх свежего эфира.
+    pipe, sheet = build(сдачи, pmp=FakePmp(), accounts=PMP_ACCOUNTS,
+                        pubs_rows=[{"ID": "W36-03", "Дата": "2026-09-02",
+                                    "Площадка": "instagram", "Ссылка": "",
+                                    "Медиа ID": T.PENDING},
+                                   {"ID": "W36-09", "Дата": "46269",
+                                    "Площадка": "instagram", "Ссылка": "",
+                                    "Медиа ID": "pmp:777"}])
+    pipe.run()
+    assert not pipe.pmp.posted, \
+        u"сегодня в instagram уже был эфир (дата числом) - досыл обязан подождать"
+
+    # --- 33. 🔴 пост, упавший при живом аккаунте, тоже встает в очередь досыла
+    # 🔴 Ровно случай 04.09: аккаунт числился подключенным, публикация создалась,
+    # а пост в Instagram не вышел (post_status 3). ВК рядом вышел. Такт видел
+    # эту ошибку в ответе сервиса и молчал: строка учета навсегда осталась
+    # с pmp:id и пустой ссылкой, и ролик считался вышедшим везде.
+    упавший = FakePmp()
+    упавший.posts = [{"account_id": 2248535, "post_status": 1,
+                      "url": "https://vk.ru/clip-1_1"},
+                     {"account_id": 2248551, "post_status": 3}]
+    pipe, sheet = build([], pmp=упавший, accounts=PMP_ACCOUNTS,
+                        pubs_rows=[{"ID": "W36-03", "Дата": "2026-09-04",
+                                    "Площадка": "instagram", "Ссылка": "",
+                                    "Медиа ID": "pmp:31967175"},
+                                   {"ID": "W36-03", "Дата": "2026-09-04",
+                                    "Площадка": "vk", "Ссылка": "",
+                                    "Медиа ID": "pmp:31967175"}])
+    pipe.run()
+    ig = [p for p in pipe.pubs.rows if p.get("Площадка") == "instagram"][0]
+    вк = [p for p in pipe.pubs.rows if p.get("Площадка") == "vk"][0]
+    assert ig["Медиа ID"] == T.PENDING, \
+        u"упавший пост обязан встать в очередь досыла, а стоит %r" % ig["Медиа ID"]
+    assert вк["Ссылка"] == "https://vk.ru/clip-1_1", \
+        u"вышедшему посту падение соседа не мешает: %r" % вк["Ссылка"]
+    assert any(u"instagram" in n.lower() for n in pipe.bot.notes), \
+        u"владелец не узнал, что пост упал: %s" % pipe.bot.notes
+
+    print("tick selftest OK: 36 проверок - полный путь, одна публикация за такт, "
           "идемпотентность, зависшее, сдвиг листа, ошибки, секреты, перевалка, "
           "публичный лог не выдает содержание, имена колонок сняты с живой формы, "
           "механика доезжает до учета и ее пропажа слышна, отступление креатора "
-          "помечено и не выдается за замысел")
+          "помечено и не выдается за замысел, потерянная площадка (отключенная "
+          "или упавшая) попадает в учет, слышна и досылается по одному в день, "
+          "а день эфира берется из ПЛАНА, а не из дня одобрения")
 
 
 if __name__ == "__main__":
