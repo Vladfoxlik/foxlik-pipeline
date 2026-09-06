@@ -439,11 +439,17 @@ class Pipeline:
                          % (row["_row"], row[COL_STATUS]))
                 continue
             if press["action"] == "ok":
-                self.sheet.set_many(row["_row"], {
-                    COL_STATUS: APPROVED,
-                    COL_DATE: row.get(COL_DATE) or self.air_date_of(
-                        self.plan_key(row.get(COL_PLAN)))})
+                день = row.get(COL_DATE) or self.air_date_of(
+                    self.plan_key(row.get(COL_PLAN)))
+                self.sheet.set_many(row["_row"], {COL_STATUS: APPROVED,
+                                                  COL_DATE: день})
                 row[COL_STATUS] = APPROVED
+                # 🔴 День эфира кладется и В ПАМЯТЬ такта, не только в лист.
+                # Замер 06.09 на живом ролике W36-07: дата 07.09 записалась
+                # в таблицу, а pick_due ниже в том же такте читал этот же
+                # словарь со старым пустым значением - и ролик ушел сегодня,
+                # вторым за вечер. Оба конца связи, живое значение.
+                row[COL_DATE] = день
                 verdict = "✅ Годен"
             else:
                 self.sheet.set(row["_row"], COL_STATUS, RESHOOT)
