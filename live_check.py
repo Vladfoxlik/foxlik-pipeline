@@ -60,6 +60,27 @@ def telegram_send():
     print("Теперь нажмите кнопку в Telegram и запустите: python live_check.py telegram-read")
 
 
+def описать_аккаунты(accounts):
+    """Строка для доктора. Отвал площадки - отказ проверки, а не примечание.
+
+    🔴 Чем оплачено: 05.09 Instagram отключился от сервиса, доктор напечатал
+    «аккаунтов подключено: 1» и следом «🎉 все узлы отвечают». Отвал заметили
+    только по письму сервиса о непрошедшей публикации, через сутки. Теперь
+    отключенная площадка валит проверку, и ее имя видно в списке «нужно».
+    """
+    def имена(xs):
+        return ", ".join(a.get("name", "?") for a in xs) or "нет"
+
+    живые = [a for a in accounts if a.get("connection_status") == 1]
+    отпавшие = [a for a in accounts if a.get("connection_status") != 1]
+    if отпавшие:
+        raise RuntimeError("ОТКЛЮЧЕНЫ от сервиса: %s (подключено: %s)"
+                           % (имена(отпавшие), имена(живые)))
+    if not живые:
+        raise RuntimeError("подключенных площадок нет - публиковать некуда")
+    return "аккаунтов подключено: %s (%s)" % (len(живые), имена(живые))
+
+
 def doctor():
     """Что готово, чего не хватает. Проверяет доступом, а не наличием строки в .env."""
     env = read_env()
@@ -155,10 +176,7 @@ def doctor():
             raise RuntimeError("нет POSTMYPOST_TOKEN")
         pid = env.get("POSTMYPOST_PROJECT_ID") or os.environ.get(
             "POSTMYPOST_PROJECT_ID", 358244)
-        accounts = postmypost.Postmypost(token, pid).accounts()
-        живые = [a for a in accounts if a.get("connection_status") == 1]
-        return "аккаунтов подключено: %s (%s)" % (
-            len(живые), ", ".join(a.get("name", "?") for a in живые) or "нет")
+        return описать_аккаунты(postmypost.Postmypost(token, pid).accounts())
 
     check("Google", google, "шаг 1: ключ в корень проекта, таблицу расшарить на робота")
     check("Папка сдач", uploads,
@@ -166,7 +184,9 @@ def doctor():
     check("Бот", tg, "TELEGRAM_BOT_TOKEN в .env")
     check("Группа", group, "TELEGRAM_GROUP_ID в .env")
     check("Postmypost", pmp,
-          "POSTMYPOST_TOKEN в .env, модуль «API» включен в app.postmypost.io/billing")
+          "POSTMYPOST_TOKEN в .env, модуль «API» включен в app.postmypost.io/billing. "
+          "Площадка отвалилась - кабинет: Аккаунты → Переподключить → «Instagram "
+          "через Facebook» (замерено 05.09: вход в сам Instagram не нужен)")
     check("Cloudinary", cloud, "шаг 4: cloudinary.com, CLOUDINARY_URL в .env")
 
     # 🔴 Instagram и ВК своими токенами отменены решением владельца 29.08: публикует
