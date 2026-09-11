@@ -274,6 +274,24 @@ class Pipeline:
             return план.isoformat()
         return self.today.isoformat()
 
+    def caption_of(self, row):
+        """Подпись к посту: из ПЛАНА, а у свободного окна - комментарий креатора.
+
+        🔴 Решение владельца 10.09: в свободном окне идею задает креатор, и описание
+        к посту заранее в ПЛАН не написать. Раньше подпись бралась только из ПЛАНА,
+        и такая строка вечно стояла бы в «отложено: нет описания».
+        🔴 Обычная строка комментарий в подпись НЕ берет: там креатор пишет нам
+        («снимала на кухне, свет так себе»), а не зрителям.
+        """
+        self._load_plan()
+        key = self.plan_key(row.get(COL_PLAN))
+        свое = (self._captions.get(key) or "").strip()
+        if свое:
+            return свое
+        if (self._mechanics.get(key) or "").strip().lower() == "своя идея":
+            return (row.get(COL_COMMENT) or "").strip()
+        return ""
+
     def product_of(self, plan_id):
         """Название товара этой строки плана - ключ к артикулам и ссылкам."""
         self._load_plan()
@@ -523,7 +541,7 @@ class Pipeline:
             if when and when > self.today:
                 continue
             key = self.plan_key(row.get(COL_PLAN))
-            if not (self._captions.get(key) or "").strip():
+            if not self.caption_of(row):
                 self._defer(row, "в ПЛАНЕ нет описания к посту для «%s»"
                             % (key or "?"))
                 continue
@@ -570,7 +588,7 @@ class Pipeline:
         self.say("строка %s взята в публикацию" % row["_row"])
         plan_key = self.plan_key(row.get(COL_PLAN))
         self._load_plan()
-        caption = self._captions.get(plan_key, "")
+        caption = self.caption_of(row)
         if not caption:
             # 🔴 Пустой пост хуже отказа: ролик уйдет в эфир без текста и ссылки,
             # переснять его нельзя, а место в ленте уже занято. Останавливаемся
@@ -861,7 +879,7 @@ class Pipeline:
         if сдача is None:
             self.say("досыл %s в %s: сдача с файлом не найдена" % (plan_id, площадка))
             return
-        caption = self._captions.get(plan_id, "")
+        caption = self.caption_of(сдача)
         if not caption:
             self.say("досыл %s: в ПЛАНЕ нет описания к посту" % plan_id)
             return
