@@ -292,6 +292,17 @@ class Pipeline:
             return (row.get(COL_COMMENT) or "").strip()
         return ""
 
+    def creator_of(self, plan_id):
+        """Имя креатора из строки ПЛАНА. Пусто - вызывающий подставит почту.
+
+        🔴 11.09: в учет уезжала почта сдающего. Ксения сдала с другой почты,
+        и срез по людям получил бы «нового креатора» на ровном месте. Имя
+        отвечает на «кому назначено», почта сдающего едет отдельной колонкой
+        и отвечает на «кто снял» - обе стороны нужны, но путать их нельзя.
+        """
+        self._load_plan()
+        return self._creators.get(self.plan_key(plan_id), "")
+
     def product_of(self, plan_id):
         """Название товара этой строки плана - ключ к артикулам и ссылкам."""
         self._load_plan()
@@ -359,6 +370,7 @@ class Pipeline:
         self._mechanics, self._axes, self._captions = {}, {}, {}
         self._slots = {}
         self._air_dates = {}    # ID -> плановый день эфира (колонка «Дата в эфир»)
+        self._creators = {}     # ID -> имя креатора из ПЛАНА (в учет едет оно)
         if self.plan is not None:
             try:
                 строки_плана = self.plan.read()
@@ -369,6 +381,7 @@ class Pipeline:
                         continue
                     self._mechanics[key] = (row.get("Механика") or "").strip()
                     self._captions[key] = (row.get(COL_CAPTION) or "").strip()
+                    self._creators[key] = (row.get("Креатор") or "").strip()
                     день = _as_date(row.get(COL_PLAN_DATE))
                     if день:
                         self._air_dates[key] = день
@@ -698,7 +711,10 @@ class Pipeline:
                                   # 🔴 без него metrics.py не сможет снять замер на Д7:
                                   # insights запрашиваются по идентификатору медиа, не по ссылке
                                   "Медиа ID": media_ids.get(platform, ""),
-                                  "Креатор": row.get(COL_EMAIL, ""),
+                                  # 🔴 11.09: имя из ПЛАНА, а не почта сдающего
+                                  "Креатор": (self.creator_of(plan_id)
+                                              or row.get(COL_EMAIL, "")),
+                                  "Почта сдающего": row.get(COL_EMAIL, ""),
                                   # 🔴 без нее словарь механик пропустит этот ролик,
                                   # и партия не попадет в память петли
                                   "Механика": mechanic,
@@ -726,7 +742,10 @@ class Pipeline:
                                   "Площадка": platform,
                                   "Ссылка": "",
                                   "Медиа ID": PENDING,
-                                  "Креатор": row.get(COL_EMAIL, ""),
+                                  # 🔴 11.09: имя из ПЛАНА, а не почта сдающего
+                                  "Креатор": (self.creator_of(plan_id)
+                                              or row.get(COL_EMAIL, "")),
+                                  "Почта сдающего": row.get(COL_EMAIL, ""),
                                   "Механика": mechanic,
                                   "Соответствие": ("холостой прогон" if self.вхолостую
                                                    else match),
