@@ -4,9 +4,12 @@
 Зависимостей нет намеренно - код должен запускаться и локально в venv без pip,
 и в GitHub Actions без шага установки.
 """
+import http.client
 import json
 import mimetypes
 import re
+import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,6 +23,19 @@ _SECRETS = [
     (re.compile(r"/bot\d+:[A-Za-z0-9_-]+"), "/bot<ТОКЕН>"),
     (re.compile(r"((?:access_token|api_key|assertion|key)=)[^&\s\"']+"), r"\1<СКРЫТО>"),
 ]
+
+# 🔴 Повтор при сетевом обрыве (замер 11.09): такт упал на чтении таблицы Google -
+# «Connection reset by peer» прямо в установке защищенного канала, а следующий
+# прогон через 50 минут прошел чисто. Одиночный обрыв в облаке - обычное дело,
+# и без повтора каждый из них становится падением такта или тревогой владельцу.
+# Повторяется ТОЛЬКО чтение (GET, HEAD): запись при обрыве могла дойти до сервиса,
+# и повтор публикации дал бы двойной эфир - то, от чего конвейер защищен первым делом.
+RETRY_WAIT = (2, 5)                       # пауза перед 2-й и 3-й попыткой, секунды
+TRANSIENT_HTTP = (429, 500, 502, 503, 504)
+_SAFE_METHODS = ("GET", "HEAD")
+# точки подмены для проверок: сеть и сон без настоящих вызовов
+_urlopen = urllib.request.urlopen
+_sleep = time.sleep
 
 
 def mask(text):
@@ -38,6 +54,32 @@ class HttpError(Exception):
         super().__init__("HTTP %s на %s: %s" % (status, self.url, self.body[:400]))
 
 
+def _with_retry(req, timeout, read):
+    """Открывает запрос и читает ответ; чтение при обрыве повторяет.
+
+    Повтор накрывает и открытие, и чтение тела: обрыв бывает в обоих местах.
+    Ошибка по сути (4xx) не повторяется никогда - повтор ее не лечит.
+    """
+    повторять = req.get_method() in _SAFE_METHODS
+    паузы = (0,) + RETRY_WAIT
+    for i, пауза in enumerate(паузы):
+        последняя = i == len(паузы) - 1
+        if пауза:
+            _sleep(пауза)
+        try:
+            with _urlopen(req, timeout=timeout) as r:
+                return read(r)
+        except urllib.error.HTTPError as e:
+            if повторять and e.code in TRANSIENT_HTTP and not последняя:
+                continue
+            raise HttpError(e.code, e.read().decode("utf-8", "replace"), req.full_url)
+        except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout,
+                http.client.HTTPException):
+            if повторять and not последняя:
+                continue
+            raise
+
+
 def request(url, method="GET", params=None, data=None, headers=None,
             timeout=120, raw_body=None):
     """Один запрос. params идут в строку, data - form-urlencoded телом.
@@ -52,11 +94,7 @@ def request(url, method="GET", params=None, data=None, headers=None,
         body = urllib.parse.urlencode(data).encode("utf-8")
         hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
     req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            text = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        raise HttpError(e.code, e.read().decode("utf-8", "replace"), url)
+    text = _with_retry(req, timeout, lambda r: r.read().decode("utf-8", "replace"))
     return _maybe_json(text)
 
 
@@ -69,11 +107,8 @@ def download(url, params=None, headers=None, timeout=600):
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read(), r.headers.get("Content-Type", "")
-    except urllib.error.HTTPError as e:
-        raise HttpError(e.code, e.read().decode("utf-8", "replace"), url)
+    return _with_retry(req, timeout,
+                       lambda r: (r.read(), r.headers.get("Content-Type", "")))
 
 
 def post_file(url, field, filename, content, extra=None, headers=None, timeout=600):
@@ -133,7 +168,70 @@ def selftest():
     body = _multipart_for_test()
     assert b'name="video_file"' in body and b"filename=\"a.mp4\"" in body
     assert body.rstrip().endswith(b"--")
-    print("http selftest OK: строка запроса, разбор ответа, multipart")
+    # 🔴 Обрыв соединения при ЧТЕНИИ повторяется, а не валит такт (замер 11.09:
+    # такт упал на чтении таблицы Google - «Connection reset by peer» прямо
+    # в установке защищенного канала, следующий прогон прошел чисто).
+    global _urlopen, _sleep
+    настоящие = (_urlopen, _sleep)
+    try:
+        вызовы = []
+
+        def обрыв_дважды(req, timeout=None):
+            вызовы.append(req.get_method())
+            if len(вызовы) < 3:
+                raise urllib.error.URLError(
+                    ConnectionResetError(104, "Connection reset by peer"))
+            return _FakeResponse(b'{"ok": true}')
+
+        _urlopen, _sleep = обрыв_дважды, (lambda s: None)
+        assert request("https://x/y") == {"ok": True}, u"чтение не пережило обрыв"
+        assert len(вызовы) == 3, вызовы
+
+        # 🔴 ЗАПИСЬ при обрыве НЕ повторяется: сервис мог успеть создать публикацию,
+        # и повтор дал бы двойной эфир - то, от чего конвейер защищен в первую очередь
+        del вызовы[:]
+        try:
+            request("https://x/y", method="POST", raw_body=b"{}")
+            assert False, u"обрыв записи обязан подниматься наверх, а не повторяться"
+        except urllib.error.URLError:
+            pass
+        assert вызовы == ["POST"], u"запись повторилась: %s" % вызовы
+
+        # ошибка по сути (4xx) не повторяется даже у чтения: повтор ее не лечит
+        del вызовы[:]
+
+        def отказ(req, timeout=None):
+            вызовы.append(req.get_method())
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+
+        _urlopen = отказ
+        try:
+            request("https://x/y")
+            assert False, u"403 обязан подниматься как HttpError"
+        except HttpError as e:
+            assert e.status == 403, e
+        assert len(вызовы) == 1, u"403 повторился: %s" % вызовы
+    finally:
+        _urlopen, _sleep = настоящие
+    print("http selftest OK: строка запроса, разбор ответа, multipart, повтор чтения "
+          "при обрыве, запись и 4xx не повторяются")
+
+
+class _FakeResponse(object):
+    """Ответ для проверок: то же, что отдает urlopen, без сети."""
+
+    def __init__(self, body, ctype="application/json"):
+        self._body = body
+        self.headers = {"Content-Type": ctype}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def _url_for_test(url, params):
