@@ -201,7 +201,45 @@ def selftest():
     assert posts and posts[0]["link"].startswith("https://www.instagram.com/"), posts
     assert posts[1]["url"].startswith("https://vk.com/"), posts
 
+    # --- 🔴 обрыв связи при заливке файла: повтор, а не ОШИБКА ------------
+    # Замер 13.09: W37-02 (20 МБ) и W37-01 упали с «The write operation timed
+    # out» при заливке в хранилище, а W37-03 (25 МБ) на следующий день прошел.
+    # Дело не в размере, а в связи - и у заливки не было ни одного повтора.
+    # Заливка идет ДО создания публикации, повтор двойного эфира не дает.
+    import socket
+    import urllib.error
+
+    class Обрывы(FakeApi):
+        def __init__(self, обрывов, **kw):
+            FakeApi.__init__(self, **kw)
+            self.обрывов = обрывов
+
+        def post_file(self, *a, **kw):
+            if self.обрывов > 0:
+                self.обрывов -= 1
+                raise urllib.error.URLError(socket.timeout("The write operation timed out"))
+            return FakeApi.post_file(self, *a, **kw)
+
+    паузы = []
+    api = Обрывы(1, statuses=[1])
+    fid = with_api(api, lambda: P.Postmypost("TOKEN", PROJECT, sleep=паузы.append)
+                   .upload_bytes(b"\x00", "ролик.mov"))
+    assert fid == 778899, "после одного обрыва файл обязан дойти со второй попытки"
+    assert len(api.s3) == 1 and паузы, "повтор - после паузы, а не сразу"
+
+    api = Обрывы(100, statuses=[1])
+    try:
+        with_api(api, lambda: client().upload_bytes(b"\x00", "ролик.mov"))
+        raise AssertionError("связь лежит - заливка обязана сдаться с понятной ошибкой")
+    except P.UploadError as e:
+        assert "обрыв" in str(e).lower(), e
+        assert 100 - api.обрывов == P.UPLOAD_ATTEMPTS, "число попыток ограничено"
+    assert not any(c[1] == "/publications" for c in api.calls), \
+        "🔴 без файла публикация не создается"
+    assert issubclass(P.UploadError, P.PublishError), "старые обработчики ловят и ее"
+
     print("postmypost selftest OK: file_id против id загрузки, вариант B без complete, "
+          "обрыв связи при заливке повторяется, "
           "поля хранилища точь-в-точь, тип 4 и статус 5, пустая деталь, стена тарифа")
 
 

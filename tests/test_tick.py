@@ -296,6 +296,35 @@ def selftest():
     assert any("Не опубликовалось" in n for n in pipe.bot.notes)
     assert log, "такт обязан вернуть журнал, а не умереть"
 
+    # --- 12б. 🔴 обрыв при заливке файла: ролик возвращается в очередь ---
+    # Замер 13.09: W37-01 и W37-02 упали с «The write operation timed out»
+    # при заливке в сервис и получили терминальную ОШИБКУ. Кнопки по такой
+    # строке уже не работают - ролики застряли, эфир 13.09 был пуст, а
+    # владелец получил сырой текст ошибки. Заливка идет ДО создания
+    # публикации, так что возврат в очередь двойного эфира не дает.
+    обрыв = T.postmypost.UploadError("файл не загрузился: обрыв связи")
+    pmp = FakePmp(fail=обрыв)
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01")],
+                        pmp=pmp, accounts=PMP_ACCOUNTS)
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.APPROVED, "обрыв связи - не приговор строке"
+    assert "попытка 1 из" in sheet.rows[0][T.COL_REASON], sheet.rows[0][T.COL_REASON]
+    assert not any("Не опубликовалось" in n for n in pipe.bot.notes), pipe.bot.notes
+    assert any("повторю" in n for n in pipe.bot.notes), pipe.bot.notes
+    # следующий такт тот же ролик действительно берет и публикует
+    pmp.fail = None
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED, sheet.rows[0]
+    assert sheet.rows[0][T.COL_REASON] == "", "успех стирает след обрыва"
+
+    # третий обрыв подряд - уже не случайность: ОШИБКА и человеческий текст
+    r = row(status=T.APPROVED, date="2026-09-01")
+    r[T.COL_REASON] = "обрыв связи при загрузке, попытка 2 из 3"
+    pipe, sheet = build([r], pmp=FakePmp(fail=обрыв), accounts=PMP_ACCOUNTS)
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.FAILED, sheet.rows[0]
+    assert any("не загрузился" in n for n in pipe.bot.notes), pipe.bot.notes
+
     # --- 13. 🔴 секрет не попадает ни в таблицу, ни в сообщение владельцу ---
     leak = "HTTP 400 на https://api.telegram.org/bot123456:AAHsecretTOKENvalue/x"
     pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01")],

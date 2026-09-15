@@ -24,7 +24,9 @@ MCP-сервера нашим токеном. Четыре шага:
 поднимается своим классом TariffError: это не сбой сети и не повод повторять запрос.
 """
 import json
+import socket
 import time
+import urllib.error
 
 from . import http
 
@@ -50,6 +52,19 @@ class PublishError(Exception):
 
 class TariffError(PublishError):
     """Модуль API не включен. Повторять запрос бессмысленно - нужен человек в биллинге."""
+
+
+# 🔴 Заливка файла в хранилище повторяется при обрыве связи. Замер 13.09: W37-02
+# (20 МБ) и W37-01 упали с «The write operation timed out», а W37-03 (25 МБ)
+# на следующий день прошел - дело в связи, не в размере. Повтор безопасен:
+# заливка идет до создания публикации, двойного эфира он не дает.
+UPLOAD_ATTEMPTS = 3
+UPLOAD_WAIT = (10, 30)      # паузы между попытками, секунды
+
+
+class UploadError(PublishError):
+    """Файл не дошел до хранилища: связь рвется. Публикация еще не создана,
+    поэтому строку можно спокойно вернуть в очередь (так и делает tick.py)."""
 
 
 class Postmypost:
@@ -117,7 +132,27 @@ class Postmypost:
         return self._wait_file(r["id"])
 
     def upload_bytes(self, content, filename):
-        """Вариант A: файл у нас на руках, до 5 ГБ. Заливка в хранилище своими руками."""
+        """Вариант A: файл у нас на руках, до 5 ГБ. Заливка в хранилище своими руками.
+
+        Обрыв связи повторяется до UPLOAD_ATTEMPTS раз, каждый раз с новой
+        загрузкой: полузалитый файл сервис не доберет. Ответ сервиса с кодом
+        ошибки - не обрыв, а отказ: он не повторяется и уходит как есть.
+        """
+        последняя = None
+        for попытка in range(UPLOAD_ATTEMPTS):
+            try:
+                return self._upload_once(content, filename)
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, socket.timeout, TimeoutError,
+                    ConnectionError) as e:
+                последняя = e
+                if попытка + 1 < UPLOAD_ATTEMPTS:
+                    self._sleep(UPLOAD_WAIT[min(попытка, len(UPLOAD_WAIT) - 1)])
+        raise UploadError("файл не загрузился в сервис за %d попытки: обрыв связи (%s)"
+                          % (UPLOAD_ATTEMPTS, последняя))
+
+    def _upload_once(self, content, filename):
         r = self._call("/upload/init", method="POST",
                        body={"project_id": self.project, "name": filename,
                              "size": len(content)}) or {}

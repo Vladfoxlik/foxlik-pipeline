@@ -493,13 +493,15 @@ def подсказки_из_плана(план):
     sys.path.insert(0, str(ROOT / "tools"))
     import cards
     values = cards.read_values(open(str(ROOT / "data" / "ценности.tsv"),
-                                    encoding="utf-8"))
+                                    encoding="utf-8-sig"))
     профили = cards.read_profiles(open(str(ROOT / "data" / "креаторы.tsv"),
-                                       encoding="utf-8"))
+                                       encoding="utf-8-sig"))
     out = {}
     for строка in план:
         профиль = профили.get(строка.get(u"Креатор", ""))
-        if not профиль:
+        # 🔴 11.09: свободное окно роняло выдачу - ребенка «на выбор» нет
+        # в профиле. Условие берется у карточек, второй копии нет.
+        if not профиль or cards.свободное_окно(строка):
             continue
         сцена = строка.get(u"Что в кадре", u"")
         в_кадре = cards.дети_в_кадре(строка, профиль)
@@ -651,7 +653,7 @@ def push_памятку(book):
 
 def read_plan(path):
     u"""План партии из TSV: первая строка - заголовки."""
-    текст = Path(path).read_text(encoding="utf-8")
+    текст = Path(path).read_text(encoding="utf-8-sig")
     строки = [s for s in текст.split(u"\n") if s.strip()]
     заголовок = строки[0].split(u"\t")
     out = []
@@ -663,6 +665,17 @@ def read_plan(path):
     return out
 
 
+def show_line(строка):
+    u"""Строка выдачи одной строкой - для показа владельцу перед заливкой.
+
+    🔴 11.09: показ падал на форматировании, а подписи съехали. Даты эфира
+    в выдаче нет намеренно (владелец 02.09), креатору нужна одна дата.
+    """
+    return u"%s · прислать до %s · %s · %s" % (
+        строка[u"№"], строка[u"Прислать до"],
+        строка[u"Кто снимает"], строка[u"Товар"])
+
+
 def main(argv):
     if "--selftest" in argv:
         sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
@@ -671,9 +684,7 @@ def main(argv):
     if "--show" in argv:
         план = read_plan(argv[argv.index("--show") + 1])
         for строка in handout_rows(план, подсказки=подсказки_из_плана(план)):
-            print(u"%s · выход %s · снять до %s · %s · %s"
-                  % (строка[u"№"], строка[u"Прислать до"],
-                     строка[u"Кто снимает"], строка[u"Товар"]))
+            print(show_line(строка))
         просрочка = overdue(план)
         if просрочка:
             print(u"⚠️ срок этих строк уже прошел: %s" % u", ".join(просрочка))
