@@ -1283,7 +1283,25 @@ def selftest():
     pipe.run()
     assert not [n for n in pipe.bot.notes if u"Сдан" in n], pipe.bot.notes
 
-    print("tick selftest OK: 42 проверки - полный путь, одна публикация за такт, "
+    # --- 43. 🔴 отчеты подключены к такту и не смеют остановить эфир (В48) --
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01")])
+    pipe.settings = FakeSheet([])
+    pipe.now = datetime.datetime(2026, 9, 4, 20, 5, tzinfo=T.MSK)
+    pipe.run()
+    assert any(u"Завтра" in n for n in pipe.bot.notes), \
+        u"сводка на завтра не дошла из такта: %s" % pipe.bot.notes
+    assert pipe.ig.posted, u"эфир обязан состояться и с отчетами"
+
+    class Broken(FakeSheet):
+        def read(self):
+            raise RuntimeError("НАСТРОЙКИ недоступны")
+    pipe, sheet = build([row(status=T.APPROVED, date="2026-09-01")])
+    pipe.settings = Broken([])
+    pipe.now = datetime.datetime(2026, 9, 4, 20, 5, tzinfo=T.MSK)
+    pipe.run()
+    assert pipe.ig.posted, u"сбой отчетов остановил эфир"
+
+    print("tick selftest OK: 43 проверки - полный путь, одна публикация за такт, "
           "идемпотентность, зависшее, сдвиг листа, ошибки, секреты, перевалка, "
           "публичный лог не выдает содержание, имена колонок сняты с живой формы, "
           "механика доезжает до учета и ее пропажа слышна, отступление креатора "

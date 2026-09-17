@@ -34,6 +34,7 @@ import traceback
 
 from lib import (cloudinary, dates, drive, google_auth, http, instagram,
                  platforms, postmypost, sheets, telegram, vk)
+import reports
 
 # Каналы Postmypost, сняты живьем 31.08 запросом /channels.
 # 🔴 Имена площадок обязаны совпадать с теми, что уже ходят по петле: metrics.py
@@ -49,6 +50,7 @@ MSK = datetime.timezone(datetime.timedelta(hours=3))
 SHEET_SUBMISSIONS = "СДАЧИ"
 SHEET_PUBLICATIONS = "ПУБЛИКАЦИИ"
 SHEET_PLAN = "ПЛАН"
+SHEET_SETTINGS = "НАСТРОЙКИ"
 
 # Колонки листа СДАЧИ. Имена обязаны совпадать с заголовками в таблице:
 # промах ловится вслух в sheets.column_letter, а не молча.
@@ -174,7 +176,11 @@ AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "
 class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
                  today=None, plan=None, pmp=None, pmp_accounts=(), pmp_offline=(),
-                 вхолостую=False, group_chat_id=None):
+                 вхолостую=False, group_chat_id=None, settings=None, now=None):
+        # 🔴 В48, 17.09: лист НАСТРОЙКИ хранит отметки отчетов («сводку сегодня
+        # уже слали»). Нет листа - отчеты не идут, эфир от этого не зависит.
+        self.settings = settings
+        self.now = now
         # 🔴 Холостой прогон (31.08). Цепочка «сдача → приемка → эфир» ни разу
         # не проходила целиком, а проверить ее на живом ролике значит опубликовать
         # его по-настоящему в аккаунт на 415 тыс. подписчиков. В этом режиме все
@@ -1099,6 +1105,17 @@ class Pipeline:
         self.rescue_stuck(rows)       # раньше всего: иначе зависшее увидят как новое
         self.handle_presses(rows)
         self.offer_new(rows)
+        # 🔴 В48: отчеты под своим зонтиком - их сбой не смеет отменить эфир
+        if self.settings is not None:
+            try:
+                reports.Reports(plan=self.plan, subs=self.sheet, pubs=self.pubs,
+                                settings=self.settings, bot=self.bot,
+                                group_chat_id=self.group_chat_id,
+                                key_of=self.plan_key,
+                                now=self.now or datetime.datetime.now(MSK),
+                                say=self.say).run()
+            except Exception as e:
+                self.say("отчеты упали: %s" % http.mask(str(e))[:120])
         try:
             self.enrich_links()       # ссылки вышедших постов - для связи с CSV
         except Exception as e:
@@ -1299,6 +1316,7 @@ def from_env():
             pmp = None
     return Pipeline(
         group_chat_id=os.environ.get("TELEGRAM_GROUP_ID"),
+        settings=sheets.Sheet(sa, sid, SHEET_SETTINGS),
         bot=telegram.Bot(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_OWNER_ID"]),
         sheet=sheets.Sheet(sa, sid, SHEET_SUBMISSIONS),
         pubs=sheets.Sheet(sa, sid, SHEET_PUBLICATIONS),
