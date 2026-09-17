@@ -339,6 +339,22 @@ class Pipeline:
         заняты - окно опоздавших (19:30). Решение В45, 15.09."""
         return self.window_for(день) or (len(ОКНА_ДНЯ), len(ОКНА_ДНЯ) + 1)
 
+    def _is_late(self, row, when):
+        """Опоздал ли ролик: плановый день прошел по ПЛАНУ или по дате строки.
+
+        🔴 А56, замер 17.09: W37-08 по плану 16.09 одобрен 17.09. Кнопка пишет
+        в дату строки сегодня (air_date_of), и по одной этой дате ролик выглядел
+        плановым: окна 19:30 не получал, а оба вечерних уже заняли опоздавшие.
+        Дата строки в будущем - решение человека, ее не перебиваем.
+        """
+        if when and when > self.today:
+            return False
+        if when and when < self.today:
+            return True
+        self._load_plan()
+        план = self._air_dates.get(self.plan_key(row.get(COL_PLAN)))
+        return bool(план and план < self.today)
+
     def _late_fits(self, rows, row):
         """Есть ли сегодня окно для опоздавшего ролика (решение В45, 15.09).
 
@@ -356,6 +372,8 @@ class Pipeline:
             if r is row or status_of(r) not in (ON_REVIEW, ACCEPTED, APPROVED, PUBLISHING):
                 continue
             день = _as_date(r.get(COL_DATE))
+            if self._is_late(r, день):
+                continue
             if день is None:
                 self._load_plan()
                 день = self._air_dates.get(self.plan_key(r.get(COL_PLAN)))
@@ -510,6 +528,19 @@ class Pipeline:
 
     def handle_presses(self, rows):
         presses = self.bot.get_presses()
+        # 🔴 А55, 15.09: нажатие «Годен» по W37-06 пропало без следа - ни строки
+        # в логе, карточка не сменилась. Отсев в боте теперь слышен: в лог счет
+        # и причина (без содержания, лог публичный), владельцу - сообщение.
+        отсеяно = list(getattr(self.bot, "dropped", None) or [])
+        if presses or отсеяно:
+            self.say("нажатий прочитано: %d, отсеяно: %d%s"
+                     % (len(presses), len(отсеяно),
+                        (" (%s)" % ", ".join(sorted(set(отсеяно)))) if отсеяно else ""))
+        if отсеяно:
+            self.bot.notify("⚠️ Нажатие кнопки не применено: %s. Если нажимали Вы - "
+                            "нажмите еще раз по последней карточке ролика, а если не "
+                            "поможет, напишите агенту."
+                            % ", ".join(sorted(set(отсеяно))))
         if not presses:
             # 🔴 Аудит 02.09: пакет прочитан - offset обязан сдвинуться, даже
             # если нажатий в нем нет. Иначе болтовня группы копится в окне
@@ -525,9 +556,19 @@ class Pipeline:
                 self.say("нажатие мимо: %s" % e)
                 continue
             if status_of(row) not in (ON_REVIEW, ACCEPTED):
-                # повторное нажатие по старой карточке не должно откатывать статус
+                # повторное нажатие по старой карточке не должно откатывать статус.
+                # 🔴 А55: и молчать не должно - владелец видит неизменную карточку
+                # и считает, что нажатие потерялось. Говорим и снимаем кнопки.
                 self.say("нажатие по строке %s пропущено: статус уже %s"
                          % (row["_row"], row[COL_STATUS]))
+                self.bot.notify("ℹ️ По ролику %s решение уже принято, статус: %s. "
+                                "Нажатие ничего не изменило."
+                                % (row.get(COL_PLAN) or row["_row"], row[COL_STATUS]))
+                try:
+                    self.bot.lock(press["chat_id"], press["message_id"],
+                                  "статус уже %s" % row[COL_STATUS])
+                except Exception:
+                    self.say("кнопки старой карточки не сняты (сбой отправки)")
                 continue
             if press["action"] == "ok":
                 день = row.get(COL_DATE) or self.air_date_of(
@@ -625,7 +666,7 @@ class Pipeline:
             # Раньше он считал окна своего прошлого дня - там пусто, и ролик
             # уходил сразу, в любой час; а отложенный проверял тот же прошедший
             # день каждый такт и не выходил никогда.
-            if when and when < self.today:
+            if self._is_late(row, when):
                 if not self._late_fits(rows, row):
                     self._defer(row, "ролик опоздал, а сегодняшние окна нужны плановым "
                                      "роликам - выйдет в ближайший день со свободным окном")

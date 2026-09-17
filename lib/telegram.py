@@ -50,6 +50,9 @@ API = "https://api.telegram.org/bot%s/"
 CALLBACK_LIMIT = 64      # предел Telegram на callback_data, в байтах
 SEP = "|"
 PROTO = "v1"             # версия формата кнопки: старые нажатия после правки отсекутся
+# Причины отсева нажатия. Уходят в публичный лог такта, поэтому без содержания.
+DROP_FOREIGN = "нажал не владелец"
+DROP_OLD = "кнопка старого формата"
 
 
 class TelegramError(Exception):
@@ -61,6 +64,8 @@ class Bot:
         self.token = token
         self.owner = int(owner_id)
         self.seen_up_to = None      # максимальный id прочитанного пакета целиком
+        self.read = 0               # сколько обновлений было в последнем пакете
+        self.dropped = []           # причины отсеянных нажатий последнего пакета
 
     def call(self, method, **params):
         """Вложенные структуры Telegram ждет строкой JSON, а не формой."""
@@ -114,6 +119,11 @@ class Bot:
         updates = self.call("getUpdates", timeout=0, limit=100) or []
         if updates:
             self.seen_up_to = max(u["update_id"] for u in updates)
+        # 🔴 А55, 15.09: отсев был немым - нажатие владельца по W37-06 пропало,
+        # а в логе такта не осталось ни строки. Причины копятся здесь, такт
+        # говорит о них вслух.
+        self.read = len(updates)
+        self.dropped = []
         out = []
         for u in updates:
             q = u.get("callback_query")
@@ -121,10 +131,12 @@ class Bot:
                 continue
             who = (q.get("from") or {}).get("id")
             if who != self.owner:
-                continue                      # кнопку жмет только владелец
+                self.dropped.append(DROP_FOREIGN)   # кнопку жмет только владелец
+                continue
             action, row_id = unpack(q.get("data") or "")
             if not action:
-                continue                      # кнопка от прошлой версии формата
+                self.dropped.append(DROP_OLD)       # кнопка от прошлой версии формата
+                continue
             msg = q.get("message") or {}
             out.append({
                 "update_id": u["update_id"],
@@ -230,10 +242,17 @@ def selftest():
                 "id": "c2", "data": "v1|no|P26-04", "from": {"id": 999},
                 "message": {"message_id": 501, "chat": {"id": -100}}}},
             {"update_id": 13, "message": {"text": "просто болтовня"}},
+            {"update_id": 10, "callback_query": {
+                "id": "c0", "data": "ok|P26-02", "from": {"id": 369675757},
+                "message": {"message_id": 499, "chat": {"id": 369675757}}}},
         ]
         presses = bot.get_presses()
         assert len(presses) == 1, "чужое нажатие и обычное сообщение должны отсеяться"
         assert presses[0]["action"] == "ok" and presses[0]["row_id"] == "P26-03"
+        # 🔴 А55, 15.09: отсев был немым - нажатие владельца пропало без следа
+        # в логе. Теперь причина каждого отсеянного нажатия остается на боте.
+        assert sorted(bot.dropped) == sorted([DROP_FOREIGN, DROP_OLD]), bot.dropped
+        assert bot.read == 4, bot.read
 
         # чтение НЕ подтверждает - иначе падение такта съест нажатие
         reads = [c for c in calls if c[0] == "getUpdates"]
