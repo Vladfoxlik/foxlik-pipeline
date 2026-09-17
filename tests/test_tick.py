@@ -203,12 +203,17 @@ def press(key, action="ok"):
 
 
 def selftest():
-    # --- 1. новая сдача уходит владельцу и встает на приемку ---
-    pipe, sheet = build([row()])
+    # --- 1. 🔴 новая сдача одобряется сама, владельцу - отчет без кнопок (В47) ---
+    # Решение владельца 17.09: кнопки «Годен» терялись (А55), а ролики он почти
+    # не смотрит - приемка держала эфир и ничего не защищала. Теперь отчет.
+    pipe, sheet = build([row(comment="свет так себе")])
     pipe.run()
-    assert len(pipe.bot.cards) == 1, "новая сдача обязана уйти владельцу"
-    assert sheet.rows[0][T.COL_STATUS] == T.ON_REVIEW
-    assert pipe.bot.cards[0]["title"].startswith("P26-09")
+    assert not pipe.bot.cards, "карточек с кнопками больше нет"
+    assert sheet.rows[0][T.COL_STATUS] in (T.APPROVED, T.PUBLISHED), sheet.rows[0][T.COL_STATUS]
+    отчет = [n for n in pipe.bot.notes if u"Сдан" in n]
+    assert len(отчет) == 1, u"владелец не получил отчет о сдаче: %s" % pipe.bot.notes
+    assert u"P26-09" in отчет[0] and u"свет так себе" in отчет[0], отчет[0]
+    assert "link1" in отчет[0], u"в отчете нет ссылки на ролик: %s" % отчет[0]
 
     # --- 2. пустая строка формы не тревожит владельца ---
     pipe, sheet = build([row(file_="")])
@@ -272,12 +277,14 @@ def selftest():
     assert not pipe.ig.posted, "зависшее нельзя публиковать вслепую"
 
     # --- 10. 🔴 сдвиг листа: кнопка не смеет попасть в чужой ролик ---
+    # (с 17.09 строка на приемке одобряется сама, поэтому жмем «переснять»:
+    # чужое нажатие не должно отправить ролик на пересъемку)
     r = row(status=T.ON_REVIEW, plan="настоящий")
     pipe, sheet = build([r])
     stale = T.Pipeline.row_key(dict(row(time_="другое время"), _row=2))
-    pipe.bot.presses = [press(stale)]
+    pipe.bot.presses = [press(stale, "no")]
     pipe.run()
-    assert sheet.rows[0][T.COL_STATUS] == T.ON_REVIEW, "статус трогать нельзя"
+    assert sheet.rows[0][T.COL_STATUS] != T.RESHOOT, "статус трогать нельзя"
     assert any("сдвинули" in n for n in pipe.bot.notes), pipe.bot.notes
 
     # --- 11. повторное нажатие по уже опубликованной строке ничего не откатывает ---
@@ -1233,7 +1240,50 @@ def selftest():
     assert pipe.bot.locks, u"кнопки старой карточки не сняты"
     assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED, u"статус откатился"
 
-    print("tick selftest OK: 41 проверка - полный путь, одна публикация за такт, "
+    # --- 42. 🔴 автоприемка: старые карточки, повторные сдачи, отступление (В47) --
+    # Строки, зависшие на приемке до 17.09 (W37-07, 10, 13), одобряются сами.
+    # Дата эфира - из ПЛАНА, одним отчетом на такт.
+    план_42 = FakeSheet([{"ID": x, "Механика": "мама", "Описание к посту": "текст",
+                          "Дата в эфир": "2026-09-10"} for x in ("W37-07", "W37-10")])
+    висят = [row(status=T.ON_REVIEW, plan="W37-07 · Ксения · книги", file_="f7"),
+             row(status=T.ON_REVIEW, plan="W37-10 · Ксения · горка", file_="f10",
+                 time_="2026-09-03 15:00")]
+    висят[1][T.COL_MATCH] = u"Нет, отступил - напишу в комментарии"
+    pipe, sheet = build(висят, plan=план_42)
+    pipe.run()
+    assert [r[T.COL_STATUS] for r in sheet.rows] == [T.APPROVED, T.APPROVED], \
+        [r[T.COL_STATUS] for r in sheet.rows]
+    assert [r[T.COL_DATE] for r in sheet.rows] == ["2026-09-10"] * 2
+    отчеты = [n for n in pipe.bot.notes if u"Сдан" in n]
+    assert len(отчеты) == 1, u"сдачи одного такта - одним сообщением: %s" % pipe.bot.notes
+    assert u"W37-07" in отчеты[0] and u"W37-10" in отчеты[0], отчеты[0]
+    assert u"отступ" in отчеты[0].lower(), u"отступление от сценария не видно: %s" % отчеты[0]
+
+    # повторная сдача до эфира: новая версия заменяет прежнюю, прежняя - ДУБЛЬ
+    старая = row(status=T.APPROVED, plan="W37-07 · Ксения · книги", file_="old",
+                 date="2026-09-10")
+    новая = row(plan="W37-07 · Ксения · книги", file_="new", time_="2026-09-03 18:00")
+    pipe, sheet = build([старая, новая], plan=план_42)
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.DUPLICATE, sheet.rows[0][T.COL_STATUS]
+    assert sheet.rows[1][T.COL_STATUS] == T.APPROVED, sheet.rows[1][T.COL_STATUS]
+    assert any(u"заменит" in n for n in pipe.bot.notes), pipe.bot.notes
+
+    # повторная сдача после эфира: второй раз не публикуем, владелец знает
+    вышла = row(status=T.PUBLISHED, plan="W37-07 · Ксения · книги", file_="old")
+    новая = row(plan="W37-07 · Ксения · книги", file_="new", time_="2026-09-03 18:00")
+    pipe, sheet = build([вышла, новая], plan=план_42)
+    pipe.run()
+    assert sheet.rows[0][T.COL_STATUS] == T.PUBLISHED
+    assert sheet.rows[1][T.COL_STATUS] == T.DUPLICATE, sheet.rows[1][T.COL_STATUS]
+    assert any(u"уже в эфире" in n for n in pipe.bot.notes), pipe.bot.notes
+
+    # ДУБЛЬ, отложенные и вышедшие строки отчетов не порождают
+    pipe, sheet = build([row(status=T.DUPLICATE), row(status=T.PUBLISHED, file_="x")])
+    pipe.run()
+    assert not [n for n in pipe.bot.notes if u"Сдан" in n], pipe.bot.notes
+
+    print("tick selftest OK: 42 проверки - полный путь, одна публикация за такт, "
           "идемпотентность, зависшее, сдвиг листа, ошибки, секреты, перевалка, "
           "публичный лог не выдает содержание, имена колонок сняты с живой формы, "
           "механика доезжает до учета и ее пропажа слышна, отступление креатора "

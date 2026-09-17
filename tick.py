@@ -3,8 +3,8 @@
 
 За такт делается ровно четыре вещи:
 
-    1. разобрать нажатия владельца      -> ОДОБРЕН / НА_ПЕРЕСЪЕМКЕ
-    2. показать владельцу новые сдачи   -> НА_ПРИЕМКЕ
+    1. разобрать нажатия по старым карточкам -> ОДОБРЕН / НА_ПЕРЕСЪЕМКЕ
+    2. одобрить новые сдачи сами, владельцу отчет -> ОДОБРЕН (решение В47, 17.09)
     3. опубликовать ОДНУ созревшую      -> ОПУБЛИКОВАН
     4. подобрать зависшее с прошлого раза -> ОШИБКА и сигнал владельцу
 
@@ -115,6 +115,8 @@ RESHOOT = "НА_ПЕРЕСЪЕМКЕ"
 PUBLISHING = "ПУБЛИКУЕТСЯ"
 PUBLISHED = "ОПУБЛИКОВАН"
 FAILED = "ОШИБКА"
+# Сдача, замененная другой сдачей той же строки плана. В эфир не идет никогда.
+DUPLICATE = "ДУБЛЬ"
 
 # 🔴 Метка строки учета, которой эфира не досталось: площадка была отключена
 # от сервиса в момент публикации. Ставится в «Медиа ID» вместо `pmp:<id>` -
@@ -608,28 +610,74 @@ class Pipeline:
     # ---------- шаг 2: новые сдачи ----------
 
     def offer_new(self, rows):
+        """Новые сдачи одобряются сами, владельцу уходит один отчет на такт.
+
+        🔴 Решение владельца В47, 17.09: «Годен» ставился почти не глядя, а нажатия
+        терялись (А55) - W37-07, 09, 10 и 13 висели на приемке сутками, эфир
+        держался на кнопке, которая ничего не защищала. Теперь приемки нет:
+        владелец получает сводку «что сдано, с каким комментарием, когда выйдет».
+        Строки, зависшие на приемке до решения, одобряются так же.
+
+        🔴 Аудит 02.09: форма не запрещает сдать одну строку плана дважды. Раньше
+        решал владелец по пометке в карточке, теперь правило: до эфира новая
+        версия заменяет прежнюю (как с W37-01 12.09), после эфира вторая сдача
+        в эфир не идет. Оба случая попадают в отчет.
+        """
+        блоки = []
         for row in rows:
-            if status_of(row) not in (NEW, ACCEPTED):
+            if status_of(row) not in (NEW, ACCEPTED, ON_REVIEW):
                 continue
             if not row.get(COL_FILE):
                 continue                      # форма еще дописывает строку
-            # 🔴 Аудит 02.09: форма не запрещает сдать одну строку плана
-            # дважды - две карточки, два одобрения, два эфира. Машина не
-            # решает, какая сдача правильная, но обязана предупредить.
             title = row.get(COL_PLAN) or "без строки плана"
             key = self.plan_key(row.get(COL_PLAN))
-            if key and any(self.plan_key(r.get(COL_PLAN)) == key
-                           and r.get("_row") != row.get("_row")
-                           and status_of(r) not in (NEW,)
-                           for r in rows):
-                title = "⚠️ ПОВТОРНАЯ СДАЧА " + title
-            self.bot.ask_review(row_id=self.row_key(row),
-                                title=title,
-                                file_url=row[COL_FILE],
-                                comment=row.get(COL_COMMENT, ""))
-            self.sheet.set(row["_row"], COL_STATUS, ON_REVIEW)
-            row[COL_STATUS] = ON_REVIEW
-            self.say("строка %s отправлена на приемку" % row["_row"])
+            прежние = [r for r in rows
+                       if key and r is not row
+                       and self.plan_key(r.get(COL_PLAN)) == key
+                       and status_of(r) not in (NEW, DUPLICATE)]
+            if any(status_of(r) in (PUBLISHING, PUBLISHED) for r in прежние):
+                причина = "эта строка плана уже в эфире, вторая сдача не публикуется"
+                self.sheet.set_many(row["_row"], {COL_STATUS: DUPLICATE,
+                                                  COL_REASON: причина})
+                row[COL_STATUS] = DUPLICATE
+                блоки.append("⚠️ %s\nСдан повторно, но ролик уже в эфире - "
+                             "вторая версия не публикуется.\n%s"
+                             % (title, row[COL_FILE]))
+                self.say("строка %s -> %s (строка плана уже в эфире)"
+                         % (row["_row"], DUPLICATE))
+                continue
+            for r in прежние:
+                if not r.get(COL_FILE) or status_of(r) not in (
+                        ACCEPTED, ON_REVIEW, APPROVED, FAILED, RESHOOT):
+                    continue
+                self.sheet.set_many(r["_row"], {
+                    COL_STATUS: DUPLICATE,
+                    COL_REASON: "заменен повторной сдачей в строке %s" % row["_row"]})
+                r[COL_STATUS] = DUPLICATE
+                self.say("строка %s -> %s (заменена строкой %s)"
+                         % (r["_row"], DUPLICATE, row["_row"]))
+                title += "\n♻️ Сдан повторно: новая версия заменит прежнюю"
+            день = row.get(COL_DATE) or self.air_date_of(key)
+            self.sheet.set_many(row["_row"], {COL_STATUS: APPROVED, COL_DATE: день})
+            row[COL_STATUS] = APPROVED
+            row[COL_DATE] = день                # и в память такта: см. 34в
+            блок = "%s\nЭфир: %s" % (title, _short_date(день))
+            комментарий = (row.get(COL_COMMENT) or "").strip()
+            if комментарий:
+                блок += "\nКомментарий: %s" % комментарий
+            if match_of(row.get(COL_MATCH)) == MATCH_OFF:
+                блок += "\n🔴 Креатор отметил отступление от сценария"
+            блоки.append(блок + "\n" + row[COL_FILE])
+            self.say("строка %s -> %s (автоприемка)" % (row["_row"], APPROVED))
+        if not блоки:
+            return
+        заголовок = ("📥 Сдан ролик" if len(блоки) == 1
+                     else "📥 Сдано роликов: %d" % len(блоки))
+        try:
+            self.bot.notify(заголовок + "\n\n" + "\n\n".join(блоки))
+        except Exception as e:
+            # отчет не должен останавливать эфир: статусы уже записаны
+            self.say("отчет о сдачах не отправлен: %s" % http.mask(str(e))[:120])
 
     # ---------- шаг 3: публикация ----------
 
@@ -1128,6 +1176,12 @@ def _as_date(value):
     if isinstance(value, datetime.date):
         return value
     return dates.as_date(value)
+
+
+def _short_date(value):
+    """«2026-09-18» -> «18.09» для отчета владельцу; нечитаемое - как есть."""
+    день = _as_date(value)
+    return день.strftime("%d.%m") if день else (value or "не назначен")
 
 
 GOOGLE_EPOCH = datetime.date(1899, 12, 30)   # день 0 в счете Google Sheets
