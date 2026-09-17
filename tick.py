@@ -51,6 +51,7 @@ SHEET_SUBMISSIONS = "СДАЧИ"
 SHEET_PUBLICATIONS = "ПУБЛИКАЦИИ"
 SHEET_PLAN = "ПЛАН"
 SHEET_SETTINGS = "НАСТРОЙКИ"
+SHEET_CHAT = "ПЕРЕПИСКА"
 
 # Колонки листа СДАЧИ. Имена обязаны совпадать с заголовками в таблице:
 # промах ловится вслух в sheets.column_letter, а не молча.
@@ -176,7 +177,11 @@ AXES_EXTRA = ("Тема", "Товар", "Ценность", "Тип хука", "
 class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
                  today=None, plan=None, pmp=None, pmp_accounts=(), pmp_offline=(),
-                 вхолостую=False, group_chat_id=None, settings=None, now=None):
+                 вхолостую=False, group_chat_id=None, settings=None, now=None,
+                 chat_log=None):
+        # 🔴 В50, 17.09: лист ПЕРЕПИСКА - архив сообщений людей боту и в группу.
+        # Историю чата Bot API не отдает, подтвержденный пакет стирается.
+        self.chat_log = chat_log
         # 🔴 В48, 17.09: лист НАСТРОЙКИ хранит отметки отчетов («сводку сегодня
         # уже слали»). Нет листа - отчеты не идут, эфир от этого не зависит.
         self.settings = settings
@@ -538,8 +543,40 @@ class Pipeline:
 
     # ---------- шаг 1: нажатия ----------
 
+    def archive_messages(self):
+        """Сообщения людей из прочитанного пакета - в лист ПЕРЕПИСКА, до подтверждения.
+
+        🔴 В50, 17.09: Ксения ответила в группе, такт подтвердил пакет, Telegram
+        стер сообщение, и агент написал ей повторно, не зная ответа. В публичный
+        лог идет только число: содержание переписки видно только в таблице.
+        """
+        сообщения = list(getattr(self.bot, "messages", None) or [])
+        if not сообщения or self.chat_log is None:
+            return
+        записано = 0
+        for m in сообщения:
+            когда = ""
+            if m.get("date"):
+                когда = datetime.datetime.fromtimestamp(
+                    int(m["date"]), MSK).strftime("%Y-%m-%d %H:%M")
+            try:
+                self.chat_log.append({
+                    "Дата": когда, "Чат": m.get("chat_title") or "",
+                    "Автор": m.get("author") or "", "Текст": m.get("text") or "",
+                    "Файл": m.get("file") or "",
+                    "Правка": "да" if m.get("edited") else "",
+                    "ID сообщения": m.get("message_id"),
+                    "Ответ на": m.get("reply_to_id") or "",
+                    "Текст, на который ответ": m.get("reply_to_text") or ""})
+                записано += 1
+            except Exception as e:
+                self.say("архив переписки: сообщение не записано: %s"
+                         % http.mask(str(e))[:120])
+        self.say("архив переписки: записано %d из %d" % (записано, len(сообщения)))
+
     def handle_presses(self, rows):
         presses = self.bot.get_presses()
+        self.archive_messages()
         # 🔴 А55, 15.09: нажатие «Годен» по W37-06 пропало без следа - ни строки
         # в логе, карточка не сменилась. Отсев в боте теперь слышен: в лог счет
         # и причина (без содержания, лог публичный), владельцу - сообщение.
@@ -1321,6 +1358,7 @@ def from_env():
     return Pipeline(
         group_chat_id=os.environ.get("TELEGRAM_GROUP_ID"),
         settings=sheets.Sheet(sa, sid, SHEET_SETTINGS),
+        chat_log=sheets.Sheet(sa, sid, SHEET_CHAT),
         bot=telegram.Bot(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_OWNER_ID"]),
         sheet=sheets.Sheet(sa, sid, SHEET_SUBMISSIONS),
         pubs=sheets.Sheet(sa, sid, SHEET_PUBLICATIONS),

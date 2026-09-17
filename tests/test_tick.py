@@ -1324,7 +1324,30 @@ def selftest():
     pipe.run()
     assert pipe.ig.posted, u"сбой отчетов остановил эфир"
 
-    print("tick selftest OK: 43 проверки - полный путь, одна публикация за такт, "
+    # --- 44. 🔴 сообщения людей ложатся в архив ДО подтверждения пакета (В50) --
+    # Замер 17.09: Ксения ответила в группе, такт подтвердил пакет, Telegram стер
+    # сообщение, и агент написал ей второй раз, не зная ответа.
+    pipe, sheet = build([])
+    pipe.chat_log = FakeSheet([])
+    pipe.bot.messages = [{"update_id": 9, "date": 1789660800, "chat_id": -100,
+                          "chat_title": "Креаторы Foxlik", "author": "Ксения",
+                          "text": "Сын строит башню из кубиков", "file": "",
+                          "edited": False, "message_id": 1350, "reply_to_id": 1343,
+                          "reply_to_text": "Ксения, добрый день!"}]
+    confirmed_before = []
+    real_confirm = pipe.bot.confirm
+    pipe.bot.confirm = lambda: (confirmed_before.append(len(pipe.chat_log.rows)),
+                                real_confirm())[1]
+    log = pipe.run()
+    assert len(pipe.chat_log.rows) == 1, pipe.chat_log.rows
+    запись = pipe.chat_log.rows[0]
+    assert запись["Текст"] == "Сын строит башню из кубиков", запись
+    assert запись["Автор"] == "Ксения" and запись["Ответ на"] == 1343, запись
+    assert запись["Дата"].startswith("2026-"), запись
+    assert confirmed_before == [1], u"пакет подтвержден раньше, чем лег архив"
+    assert not any(u"башню" in l for l in log), u"текст сообщения ушел в публичный лог"
+
+    print("tick selftest OK: 44 проверки - полный путь, одна публикация за такт, "
           "идемпотентность, зависшее, сдвиг листа, ошибки, секреты, перевалка, "
           "публичный лог не выдает содержание, имена колонок сняты с живой формы, "
           "механика доезжает до учета и ее пропажа слышна, отступление креатора "

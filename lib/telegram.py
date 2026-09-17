@@ -66,6 +66,7 @@ class Bot:
         self.seen_up_to = None      # максимальный id прочитанного пакета целиком
         self.read = 0               # сколько обновлений было в последнем пакете
         self.dropped = []           # причины отсеянных нажатий последнего пакета
+        self.messages = []          # сообщения людей из последнего пакета (В50)
 
     def call(self, method, **params):
         """Вложенные структуры Telegram ждет строкой JSON, а не формой."""
@@ -124,10 +125,32 @@ class Bot:
         # говорит о них вслух.
         self.read = len(updates)
         self.dropped = []
+        # 🔴 В50, 17.09: историю чата бот получить не может, а подтвержденный пакет
+        # Telegram стирает. Не сохранили сообщение здесь - его нет нигде.
+        self.messages = []
         out = []
         for u in updates:
             q = u.get("callback_query")
             if not q:
+                m = u.get("message") or u.get("edited_message") or {}
+                if m and not (m.get("from") or {}).get("is_bot"):
+                    к_чему = m.get("reply_to_message") or {}
+                    файл = next((k for k in ("video", "document", "photo", "voice",
+                                             "audio", "video_note") if m.get(k)), "")
+                    self.messages.append({
+                        "update_id": u["update_id"],
+                        "date": m.get("date"),
+                        "chat_id": (m.get("chat") or {}).get("id"),
+                        "chat_title": (m.get("chat") or {}).get("title") or "личка",
+                        "author": " ".join(filter(None, [
+                            (m.get("from") or {}).get("first_name"),
+                            (m.get("from") or {}).get("last_name")])),
+                        "text": m.get("text") or m.get("caption") or "",
+                        "file": файл,
+                        "edited": "edited_message" in u,
+                        "message_id": m.get("message_id"),
+                        "reply_to_id": к_чему.get("message_id"),
+                        "reply_to_text": (к_чему.get("text") or "")[:100]})
                 continue
             who = (q.get("from") or {}).get("id")
             if who != self.owner:
@@ -247,6 +270,9 @@ def selftest():
                 "message": {"message_id": 499, "chat": {"id": 369675757}}}},
         ]
         presses = bot.get_presses()
+        # 🔴 В50, 17.09: сообщения людей не выбрасываются - такт кладет их в архив.
+        # Ответ Ксении в группе пропал: такт подтвердил пакет, и Telegram его стер.
+        assert [m["text"] for m in bot.messages] == ["просто болтовня"], bot.messages
         assert len(presses) == 1, "чужое нажатие и обычное сообщение должны отсеяться"
         assert presses[0]["action"] == "ok" and presses[0]["row_id"] == "P26-03"
         # 🔴 А55, 15.09: отсев был немым - нажатие владельца пропало без следа
