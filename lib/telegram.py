@@ -53,6 +53,8 @@ PROTO = "v1"             # версия формата кнопки: стары�
 # Причины отсева нажатия. Уходят в публичный лог такта, поэтому без содержания.
 DROP_FOREIGN = "нажал не владелец"
 DROP_OLD = "кнопка старого формата"
+# Что бот забирает из очереди: нажатия кнопок и сообщения людей для архива (В50).
+ALLOWED_UPDATES = ["message", "edited_message", "callback_query"]
 
 
 class TelegramError(Exception):
@@ -117,7 +119,11 @@ class Bot:
         `confirm` после того, как статусы записаны. Заодно запоминает границу
         всего пакета, включая чужую болтовню: подтверждать надо и ее.
         """
-        updates = self.call("getUpdates", timeout=0, limit=100) or []
+        # 🔴 27.09: типы называются явно при каждом чтении. Telegram помнит
+        # allowed_updates с прошлого вызова, и у бота осталось ["callback_query"]:
+        # сообщения группы выбрасывались до такта, архив переписки был пуст.
+        updates = self.call("getUpdates", timeout=0, limit=100,
+                            allowed_updates=ALLOWED_UPDATES) or []
         if updates:
             self.seen_up_to = max(u["update_id"] for u in updates)
         # 🔴 А55, 15.09: отсев был немым - нажатие владельца по W37-06 пропало,
@@ -283,6 +289,12 @@ def selftest():
         # чтение НЕ подтверждает - иначе падение такта съест нажатие
         reads = [c for c in calls if c[0] == "getUpdates"]
         assert all("offset" not in c[1] for c in reads), "get_presses не смеет подтверждать"
+        # 🔴 27.09: Telegram помнит allowed_updates с прошлого вызова. У бота стояло
+        # ["callback_query"], и все сообщения группы выбрасывались до такта: архив
+        # переписки (В50) десять дней был пуст. Каждое чтение называет типы явно.
+        for c in reads:
+            got = json.loads(c[1].get("allowed_updates", "[]"))
+            assert "message" in got and "callback_query" in got, c
 
         # 🔴 подтверждается граница ВСЕГО пакета (13), а не последнего нажатия (11):
         # иначе болтовня креаторов копится и вытесняет нажатия за предел в 100
