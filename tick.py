@@ -429,6 +429,19 @@ class Pipeline:
             self._links_cache = platforms.read_links(f)
         return self._links_cache
 
+    def hashtags(self):
+        """`data/хештеги.tsv`: теги по товару. Их берет только площадка, чье правило
+        просит «хештеги» (TikTok, 27.09). Нет файла - публикуем без тегов, вслух."""
+        if getattr(self, "_hashtags_cache", None) is not None:
+            return self._hashtags_cache
+        try:
+            with open(_data_file("хештеги.tsv"), encoding="utf-8-sig") as f:
+                self._hashtags_cache = platforms.read_hashtags(f)
+        except Exception as e:
+            self.say("хештеги не прочитаны, публикуем без них: %s" % str(e)[:120])
+            self._hashtags_cache = {}
+        return self._hashtags_cache
+
     def _articles(self):
         """`data/артикулы.tsv`: номера найдены замером по 195 нашим постам."""
         if getattr(self, "_articles_cache", None) is not None:
@@ -850,7 +863,8 @@ class Pipeline:
                     # напрямую - она открывает товар в приложении маркетплейса
                     # у уже авторизованного человека и метит источник перехода.
                     ozon=self.article_of(plan_key, "Ozon"),
-                    links=self.links(), товар=self.product_of(plan_key))
+                    links=self.links(), товар=self.product_of(plan_key),
+                    hashtags=self.hashtags())
                 pub_id = self.pmp.post_video_bytes(
                     content, name, caption,
                     [a["id"] for a in self.pmp_accounts], когда,
@@ -1129,7 +1143,8 @@ class Pipeline:
         детали = platforms.details(
             [аккаунт], caption, артикул=self.article_of(plan_id), file_ids=[0],
             rules=self.platform_rules(), ozon=self.article_of(plan_id, "Ozon"),
-            links=self.links(), товар=self.product_of(plan_id))
+            links=self.links(), товар=self.product_of(plan_id),
+            hashtags=self.hashtags())
         pub_id = self.pmp.post_video_bytes(
             content, name, caption, [аккаунт["id"]],
             post_at_for(self.today), черновик=self.вхолостую, details=детали)

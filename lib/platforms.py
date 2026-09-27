@@ -20,6 +20,8 @@ u"""Упаковка одного ролика под каждую площад�
 площадку или поменять лимит можно, не трогая код.
 """
 
+import re
+
 # Шаблон карточки товара на Wildberries. Проверен браузером 31.08: открывается
 # «FOXLIK / Детский игровой развивающий световой стол песочница Алфавит».
 # ⚠️ Проверять можно только глазами: на запрос из кода WB отвечает 498
@@ -73,6 +75,19 @@ def read_links(stream):
     return out
 
 
+def read_hashtags(stream):
+    u"""Хештеги по товару из TSV: {товар: [#тег, ...]}. Пустой товар - ролик без товара."""
+    rows = [line.rstrip("\n").split("\t") for line in stream if line.strip()]
+    head = [c.strip() for c in rows[0]]
+    out = {}
+    for raw in rows[1:]:
+        item = dict(zip(head, [c.strip() for c in raw] + [""] * len(head)))
+        теги = [t for t in (item.get(u"Хештеги") or "").split() if t.startswith("#")]
+        if теги:
+            out[(item.get(u"Товар") or "").strip().lower()] = теги
+    return out
+
+
 def read_rules(stream):
     u"""Правила площадок из TSV. Ключ - chanel_id (число, как в API сервиса)."""
     rows = [line.rstrip("\n").split("\t") for line in stream if line.strip()]
@@ -90,6 +105,7 @@ def read_rules(stream):
             "площадка": item.get("Площадка", ""),
             "ссылка": (item.get("Ссылка кликабельна", "") or "").lower().startswith("да"),
             "лимит": _int(item.get("Лимит текста"), 100000),
+            "тегов": _int(item.get("Хештегов максимум"), 30),
             "добавлять": (item.get("Что добавлять к тексту") or "").strip(),
             "поля": _fields(item.get("Поля публикации")),
             "заголовок": (item.get("Заголовок нужен", "") or "").lower().startswith("да"),
@@ -125,7 +141,7 @@ def _fields(text):
 
 
 def details(accounts, text, артикул, file_ids, rules, publication_type=4,
-            ozon=None, links=None, товар=None, strict_links=False):
+            ozon=None, links=None, товар=None, strict_links=False, hashtags=None):
     u"""Детали публикации: по одной на аккаунт, каждая упакована по своим правилам.
 
     `links` и `товар` включают ссылки Mobzio (решение владельца 02.09): короткая
@@ -134,6 +150,8 @@ def details(accounts, text, артикул, file_ids, rules, publication_type=4,
     `strict_links=True` требует ссылку там, где площадка ее принимает.
     """
     out = []
+    if артикул:
+        text = _без_ручного_артикула(text)
     for acc in accounts:
         канал = acc.get("chanel_id")
         правило = rules.get(канал)
@@ -149,7 +167,8 @@ def details(accounts, text, артикул, file_ids, rules, publication_type=4,
                   "content": _text_for(text, артикул, правило,
                                        ozon=ozon, ссылка=ссылка,
                                        ссылка_ozon=ссылка_ozon,
-                                       есть_справочник=links is not None)}
+                                       есть_справочник=links is not None,
+                                       теги=_tags_for(hashtags, товар, правило))}
         деталь.update(правило["поля"])
         if правило["заголовок"]:
             деталь["title"] = _title(text)
@@ -172,9 +191,38 @@ def _link_for(links, товар, правило, strict, магазин="wb"):
     return ссылка
 
 
+def _без_ручного_артикула(text):
+    u"""Убрать строки «🛒 Артикул ...», вписанные в описание руками: хвост ставит машина.
+
+    🔴 Замер 27.09 на живом W39-10: такая строка из плана плюс машинный хвост дали
+    номер дважды, причем с решеткой - Instagram делает из нее ссылку на хештег.
+    Гейт заливки плана (setup.do_plan_replace) это ловит, но W39 залит в обход него.
+    """
+    строки = [s for s in text.split("\n")
+              if not (s.strip().startswith(u"🛒") and u"ртикул" in s)]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(строки)).strip()
+
+
+def _tags_for(hashtags, товар, правило):
+    u"""Хештеги строки - только там, где правило площадки их просит (TikTok, 27.09)."""
+    if not hashtags or u"хештеги" not in правило["добавлять"]:
+        return []
+    return hashtags.get((товар or "").strip().lower(), [])[:правило.get("тегов", 30)]
+
+
+# 🔴 Слова владельца 27.09 для TikTok: «заказать выгодно на сайте FOXLIK.RU либо
+# на wb и артикул». Ссылки там не кликаются, поля «Сайт» в профиле нет.
+САЙТ = u"🛒 Заказать выгодно на сайте FOXLIK.RU"
+
+
 def _text_for(text, артикул, правило, ozon=None, ссылка=None, ссылка_ozon=None,
-              есть_справочник=False):
+              есть_справочник=False, теги=()):
     u"""Текст под площадку: ссылка там, где она кликается, номер - где нет."""
+    if u"сайт" in правило["добавлять"]:
+        хвост = САЙТ + (u"\nили на WB, артикул %s" % артикул if артикул else u"")
+        if теги:
+            хвост += u"\n\n" + u" ".join(теги)
+        return _fit(text, хвост, правило["лимит"])
     хвост = ""
     if артикул:
         if правило["добавлять"] == "ссылка":
@@ -207,8 +255,12 @@ def _text_for(text, артикул, правило, ozon=None, ссылка=None
     # в шапке профиля стоит витрина taplink с кнопками «Купить на WB / Ozon»).
     if хвост and not правило["ссылка"]:
         хвост += u"\n" + ПОДСКАЗКА_БЕЗ_ССЫЛКИ
+    return _fit(text, хвост, правило["лимит"])
+
+
+def _fit(text, хвост, лимит):
+    u"""Текст и хвост в предел площадки: режем текст, хвост сохраняем."""
     целиком = (text.strip() + ("\n\n" + хвост if хвост else "")).strip()
-    лимит = правило["лимит"]
     if len(целиком) <= лимит:
         return целиком
     # 🔴 Режем МЫ, а не площадка: она обрежет по своему усмотрению и может
