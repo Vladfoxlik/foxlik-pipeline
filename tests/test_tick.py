@@ -1377,6 +1377,74 @@ def test_accounts_allowlist():
     print("tick: аккаунты публикации берутся из списка разрешенных")
 
 
+def test_routing():
+    # 🔴 Решение владельца 27.09 (тест З11): в дни теста в 18:00 выходит залетевший
+    # ролик на двух Instagram, а два ролика Ксении расходятся - один на myplayroom_shop,
+    # второй на foxlik_for_kids. Раньше такт слал каждый ролик на ВСЕ аккаунты,
+    # а время брал из двух окон дня по учету.
+    все = [{"id": 2248535, "chanel_id": 2, "name": "FOXLIK", "connection_status": 1},
+           {"id": 2248551, "chanel_id": 1, "name": "myplayroom_shop",
+            "login": "myplayroom_shop", "connection_status": 1},
+           {"id": 2310805, "chanel_id": 9, "name": "foxlik.kids", "connection_status": 1},
+           {"id": 2310766, "chanel_id": 1, "name": "foxlik_for_kids",
+            "login": "foxlik_for_kids", "connection_status": 1}]
+    рабочие, _ = T.отобрать_аккаунты(все, "2248535,2248551,2310805,2310766*")
+    assert len(рабочие) == 4
+    assert [a["id"] for a in рабочие if a.get("по_запросу")] == [2310766]
+    assert T.площадка_аккаунта(рабочие[3]) == "instagram:foxlik_for_kids"
+    assert T.площадка_аккаунта(рабочие[1]) == "instagram", u"основной - как раньше"
+
+    день = TODAY.isoformat()
+    план = FakeSheet([
+        {"ID": "W40-01", "Механика": "мама", "Описание к посту": "один",
+         "Дата в эфир": день, "Аккаунты": "myplayroom_shop, FOXLIK, foxlik.kids",
+         "Время": "21:00"},
+        {"ID": "W40-02", "Механика": "мама", "Описание к посту": "два",
+         "Дата в эфир": день, "Аккаунты": "foxlik_for_kids, FOXLIK, foxlik.kids",
+         "Время": "19:30"},
+        {"ID": "P26-09", "Механика": "папа", "Описание к посту": "три",
+         "Дата в эфир": день}])
+    # тестовый ролик дня уже стоит в учете - окна дня он не отнимает
+    занято = [{"ID": "Z11-01", "Дата": день, "Площадка": "instagram",
+               "Медиа ID": "pmp:1"},
+              {"ID": "Z11-01", "Дата": день, "Площадка": "instagram:foxlik_for_kids",
+               "Медиа ID": "pmp:1"}]
+    pmp = FakePmp()
+    pipe, sheet = build([row(status=T.APPROVED, date=день, plan="W40-01 · Ксения"),
+                         row(status=T.APPROVED, date=день, plan="W40-02 · Ксения")],
+                        plan=план, pmp=pmp, accounts=рабочие, pubs_rows=занято)
+    pipe.now = datetime.datetime.combine(TODAY, datetime.time(12, 0), tzinfo=T.MSK)
+    pipe.run()
+    pipe.run()
+    assert len(pmp.posted) == 2, pmp.posted
+    первый, второй = pmp.posted
+    assert sorted(первый[2]) == [2248535, 2248551, 2310805], первый[2]
+    assert первый[3].startswith(день + "T21:00"), первый[3]
+    assert sorted(второй[2]) == [2248535, 2310766, 2310805], второй[2]
+    assert второй[3].startswith(день + "T19:30"), второй[3]
+    площадки = sorted((p["ID"], p["Площадка"]) for p in pipe.pubs.rows
+                      if p["ID"].startswith("W40"))
+    assert ("W40-02", "instagram:foxlik_for_kids") in площадки, площадки
+    assert ("W40-01", "instagram") in площадки and \
+        ("W40-01", "instagram:foxlik_for_kids") not in площадки, площадки
+
+    # строка без «Аккаунтов» - как раньше, но на аккаунт «по запросу» не идет
+    pmp = FakePmp()
+    pipe, sheet = build([row(status=T.APPROVED, date=день, plan="P26-09 · папа")],
+                        plan=план, pmp=pmp, accounts=рабочие)
+    pipe.run()
+    assert pmp.posted and sorted(pmp.posted[0][2]) == [2248535, 2248551, 2310805], pmp.posted
+
+    # названный аккаунт, которого нет среди рабочих, - слышно, а не молча мимо
+    pmp = FakePmp()
+    pipe, sheet = build([row(status=T.APPROVED, date=день, plan="W40-02 · Ксения")],
+                        plan=план, pmp=pmp, accounts=рабочие[:3])
+    pipe.run()
+    assert any("foxlik_for_kids" in n for n in pipe.bot.notes), pipe.bot.notes
+    print("tick: у строки плана свои аккаунты и время, второй Instagram отдельной площадкой")
+
+
 if __name__ == "__main__":
     selftest()
     test_accounts_allowlist()
+    test_routing()

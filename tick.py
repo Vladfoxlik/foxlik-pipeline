@@ -71,6 +71,11 @@ COL_CAPTION = "Описание к посту"
 # 🔴 Колонка листа ПЛАН, а не СДАЧ: день, на который строка поставлена в эфир.
 # Имя снято с живого листа 05.09 - «Дата в эфир», не «Дата публикации».
 COL_PLAN_DATE = "Дата в эфир"
+# 🔴 Тест З11 (владелец 27.09): у строки ПЛАНА могут быть свои аккаунты (имена или
+# логины через запятую) и свое время «ЧЧ:ММ». Пусто - как раньше: все аккаунты,
+# кроме «по запросу», и окна дня по учету.
+COL_ACCOUNTS = "Аккаунты"
+COL_TIME_OF_DAY = "Время"
 COL_FILE = "Файл"
 COL_COMMENT = "Комментарий"
 COL_STATUS = "Статус"
@@ -398,6 +403,30 @@ class Pipeline:
         резерв = min(резерв, max(0, len(ОКНА_ДНЯ) - занято))
         return занято + резерв < len(ОКНА_ДНЯ) + 1
 
+    def route_of(self, plan_id):
+        """(аккаунты, отключенные, неизвестные имена, время) для строки плана.
+
+        🔴 Тест З11, 27.09. Колонка «Аккаунты» пуста - все рабочие аккаунты, кроме
+        «по запросу»; заполнена - ровно названные (по логину или имени). Названный,
+        но не найденный среди рабочих - вслух: иначе ролик тихо уйдет мимо него.
+        """
+        self._load_plan()
+        имена, время = self._routes.get(self.plan_key(plan_id), ([], None))
+
+        def свой(a, x):
+            x = x.lower()
+            return x in (str(a.get("login") or "").lower(), str(a.get("name") or "").lower(),
+                         str(a.get("id")))
+
+        if not имена:
+            return ([a for a in self.pmp_accounts if not a.get("по_запросу")],
+                    [a for a in self.pmp_offline if not a.get("по_запросу")], [], время)
+        рабочие = [a for a in self.pmp_accounts if any(свой(a, x) for x in имена)]
+        отпавшие = [a for a in self.pmp_offline if any(свой(a, x) for x in имена)]
+        нет = [x for x in имена
+               if not any(свой(a, x) for a in list(self.pmp_accounts) + list(self.pmp_offline))]
+        return рабочие, отпавшие, нет, время
+
     def product_of(self, plan_id):
         """Название товара этой строки плана - ключ к артикулам и ссылкам."""
         self._load_plan()
@@ -479,6 +508,7 @@ class Pipeline:
         self._slots = {}
         self._air_dates = {}    # ID -> плановый день эфира (колонка «Дата в эфир»)
         self._creators = {}     # ID -> имя креатора из ПЛАНА (в учет едет оно)
+        self._routes = {}       # ID -> (имена аккаунтов, время) - тест З11, 27.09
         if self.plan is not None:
             try:
                 строки_плана = self.plan.read()
@@ -490,6 +520,9 @@ class Pipeline:
                     self._mechanics[key] = (row.get("Механика") or "").strip()
                     self._captions[key] = (row.get(COL_CAPTION) or "").strip()
                     self._creators[key] = (row.get("Креатор") or "").strip()
+                    имена = [x.strip() for x in str(row.get(COL_ACCOUNTS) or "").split(",")
+                             if x.strip()]
+                    self._routes[key] = (имена, _as_time(row.get(COL_TIME_OF_DAY)))
                     день = _as_date(row.get(COL_PLAN_DATE))
                     if день:
                         self._air_dates[key] = день
@@ -785,7 +818,8 @@ class Pipeline:
             # 🔴 11.09: на день приходится столько плановых роликов, сколько окон.
             # Окна кончились - строка ждет, а не встает на ту же минуту, что уже
             # занятая (случай 10.09). Назавтра она опоздавшая и идет веткой выше.
-            if self.window_for(when or self.today) is None:
+            # 🔴 З11, 27.09: у строки свое время - окна дня она не занимает и не ждет
+            if self.route_of(key)[3] is None and self.window_for(when or self.today) is None:
                 self._defer(row, "на %s оба окна дня заняты - ждем свободного дня"
                             % (when or self.today).isoformat())
                 continue
@@ -845,18 +879,35 @@ class Pipeline:
         links = {}
 
         media_ids = {}
+        аккаунты, отпавшие, нет, время = self.route_of(plan_key)
+        if нет:
+            self.bot.notify("⚠️ %s: в колонке «Аккаунты» названы %s, а среди "
+                            "подключенных их нет - ролик туда не уйдет. Проверьте "
+                            "имя в ПЛАНЕ или список POSTMYPOST_ACCOUNTS."
+                            % (plan_key or "без номера", ", ".join(нет)))
         if self.pmp:
+            if not аккаунты:
+                self.sheet.set(row["_row"], COL_STATUS, APPROVED)
+                self._defer(row, "ни одного подключенного аккаунта для этой строки")
+                return
             try:
-                # день берем из строки сдачи (его проставил владелец при одобрении),
-                # час - из замера окон; два ролика дня разводятся по 11:00/18:00
-                slot, of = self.slot_for(_as_date(row.get(COL_DATE)) or self.today)
-                когда = post_at_for(_as_date(row.get(COL_DATE)) or self.today,
-                                    slot=slot, of=of)
+                день = _as_date(row.get(COL_DATE)) or self.today
+                if время and день >= self.today:
+                    # 🔴 З11, 27.09: время строки задал человек - окна не считаем
+                    окно = datetime.datetime.combine(день, время, tzinfo=MSK)
+                    сейчас = self.now or datetime.datetime.now(MSK)
+                    когда = (окно.isoformat() if окно > сейчас
+                             else post_at_now(сейчас))
+                else:
+                    # день берем из строки сдачи (его проставил владелец при одобрении),
+                    # час - из замера окон; два ролика дня разводятся по окнам
+                    slot, of = self.slot_for(день)
+                    когда = post_at_for(день, now=self.now, slot=slot, of=of)
                 # 🔴 У каждой сети своя упаковка (31.08): в ВК ссылка кликается,
                 # в Instagram нет. Один текст на обе сети означал, что в одной
                 # из них он всегда неверный.
                 детали = platforms.details(
-                    self.pmp_accounts, caption,
+                    аккаунты, caption,
                     артикул=self.article_of(plan_key), file_ids=[0],
                     rules=self.platform_rules(),
                     # 🔴 02.09: ведем на короткую ссылку Mobzio, а не на WB
@@ -867,7 +918,7 @@ class Pipeline:
                     hashtags=self.hashtags())
                 pub_id = self.pmp.post_video_bytes(
                     content, name, caption,
-                    [a["id"] for a in self.pmp_accounts], когда,
+                    [a["id"] for a in аккаунты], когда,
                     черновик=self.вхолостую, details=детали)
             except postmypost.TariffError as e:
                 # 🔴 Стена тарифа - не сбой сети: повторять запрос бессмысленно,
@@ -877,9 +928,8 @@ class Pipeline:
                                 % (e, row["_row"]))
                 self.say("строка %s: %s" % (row["_row"], e))
                 return
-            for account in self.pmp_accounts:
-                platform = CHANNELS.get(account.get("chanel_id"), "площадка %s"
-                                        % account.get("chanel_id"))
+            for account in аккаунты:
+                platform = площадка_аккаунта(account)
                 # 🔴 Ссылки на пост в этот момент еще нет: сервис ставит публикацию
                 # в очередь и выдает свой id. По нему пост и находится потом.
                 links[platform] = ""
@@ -963,9 +1013,8 @@ class Pipeline:
             # Строка пишется ТА ЖЕ, что у вышедших, - с теми же осями и тем же
             # номером плана, - иначе досыл не найдет, что именно отправлять,
             # а замер увидит ролик вышедшим везде.
-            for account in self.pmp_offline:
-                platform = CHANNELS.get(account.get("chanel_id"), "площадка %s"
-                                        % account.get("chanel_id"))
+            for account in отпавшие:
+                platform = площадка_аккаунта(account)
                 self.pubs.append({"ID": plan_id,
                                   "Дата": self.today.isoformat(),
                                   "Площадка": platform,
@@ -979,9 +1028,8 @@ class Pipeline:
                                   "Соответствие": ("холостой прогон" if self.вхолостую
                                                    else match),
                                   **self.axes_of(plan_id)})
-            if self.pmp_offline:
-                сети = ", ".join(CHANNELS.get(a.get("chanel_id"), "?")
-                                 for a in self.pmp_offline)
+            if отпавшие:
+                сети = ", ".join(площадка_аккаунта(a) for a in отпавшие)
                 self.bot.notify("⚠️ %s: ролик вышел не везде.\nНе подключены к "
                                 "сервису: %s - эти сети ждут досыла.\nПодключите "
                                 "аккаунт в кабинете Postmypost, дальше досыл "
@@ -1021,7 +1069,7 @@ class Pipeline:
         # 🔴 Отвалившиеся аккаунты тоже в карте: их посты надо УЗНАВАТЬ, чтобы
         # пометить упавшими. Иначе строка отключенной площадки не сматчится
         # ни с чем и промолчит.
-        по_каналам = {a["id"]: CHANNELS.get(a.get("chanel_id"))
+        по_каналам = {a["id"]: площадка_аккаунта(a)
                       for a in list(self.pmp_accounts) + list(self.pmp_offline)}
         кэш = {}
         for row in self.pubs.read():
@@ -1096,8 +1144,7 @@ class Pipeline:
             return
         подключено = {}
         for a in self.pmp_accounts:
-            подключено[CHANNELS.get(a.get("chanel_id"), "площадка %s"
-                                    % a.get("chanel_id"))] = a
+            подключено[площадка_аккаунта(a)] = a
         try:
             учет = self.pubs.read()
         except Exception as e:
@@ -1254,6 +1301,24 @@ def _as_date(value):
     return dates.as_date(value)
 
 
+def _as_time(value):
+    """Время дня из ПЛАНА: «21:00», «21:00:00» или доля суток числом Google (0,875)."""
+    text = str(value or "").strip().replace(",", ".")
+    if not text:
+        return None
+    m = re.match(r"^(\d{1,2}):(\d{2})", text)
+    try:
+        if m:
+            return datetime.time(int(m.group(1)), int(m.group(2)))
+        доля = float(text)
+        if 0 <= доля < 1:
+            минут = int(round(доля * 24 * 60))
+            return datetime.time(минут // 60, минут % 60)
+    except ValueError:
+        pass
+    return None
+
+
 def _short_date(value):
     """«2026-09-18» -> «18.09» для отчета владельцу; нечитаемое - как есть."""
     день = _as_date(value)
@@ -1399,11 +1464,41 @@ def отобрать_аккаунты(все, разрешено=""):
     🔴 Отключенный аккаунт - не «его нет», а «сегодня он не в эфире». Разница видна
     только сравнением полного списка с рабочим, и без нее потеря канала проходит
     молча (случай 04.09, Instagram). Неразрешенный же - не отключенный: о нем молчим.
+    🔴 Id со звездочкой («2310766*») - аккаунт «по запросу»: туда идут только строки
+    ПЛАНА, которые назвали его в колонке «Аккаунты» (тест З11, 27.09: foxlik_for_kids
+    получает не все ролики, а выбранные).
     """
-    ids = set(x.strip() for x in str(разрешено or "").split(",") if x.strip())
-    свои = [a for a in все if not ids or str(a.get("id")) in ids]
+    ids, по_запросу = set(), set()
+    for x in str(разрешено or "").split(","):
+        x = x.strip()
+        if x.endswith("*"):
+            x = x[:-1].strip()
+            по_запросу.add(x)
+        if x:
+            ids.add(x)
+    свои = []
+    for a in все:
+        if ids and str(a.get("id")) not in ids:
+            continue
+        a = dict(a)
+        if str(a.get("id")) in по_запросу:
+            a["по_запросу"] = True
+        свои.append(a)
     return ([a for a in свои if a.get("connection_status") == 1],
             [a for a in свои if a.get("connection_status") != 1])
+
+
+def площадка_аккаунта(account):
+    u"""Имя площадки в учете. Второй Instagram - «instagram:<логин>».
+
+    🔴 27.09: учет, досыл и дотягивание ссылок различали аккаунты по имени сети,
+    и два Instagram затирали бы друг друга. Основной остается «instagram»: по этому
+    слову metrics.py и import_csv находят ролики myplayroom_shop.
+    """
+    имя = CHANNELS.get(account.get("chanel_id"), "площадка %s" % account.get("chanel_id"))
+    if account.get("по_запросу"):
+        имя += ":" + str(account.get("login") or account.get("name") or account.get("id"))
+    return имя
 
 
 def main():
