@@ -1348,12 +1348,10 @@ def from_env():
         pmp = postmypost.Postmypost(os.environ["POSTMYPOST_TOKEN"],
                                     os.environ.get("POSTMYPOST_PROJECT_ID", 358244))
         try:
-            все = pmp.accounts()
-            pmp_accounts = [a for a in все if a.get("connection_status") == 1]
-            # 🔴 Отключенный аккаунт - не «его нет», а «сегодня он не в эфире».
-            # Разница видна только сравнением полного списка с рабочим, и без
-            # нее потеря канала проходит молча (случай 04.09, Instagram).
-            pmp_offline = [a for a in все if a.get("connection_status") != 1]
+            pmp_accounts, pmp_offline = отобрать_аккаунты(
+                pmp.accounts(), os.environ.get("POSTMYPOST_ACCOUNTS", ""))
+            print("публикуем на: %s" % (", ".join(
+                str(a.get("name")) for a in pmp_accounts) or "никуда"))
         except postmypost.TariffError as e:
             # публиковать нечем - но такт обязан доработать: приемка и сдачи живут
             print("Postmypost выключен: %s" % e, file=sys.stderr)
@@ -1373,6 +1371,24 @@ def from_env():
         # 🔴 Холостой прогон включается переменной среды, а не флагом командной
         # строки: такт запускается из расписания, где аргументы не передашь.
         вхолостую=bool(os.environ.get("DRY_RUN")))
+
+
+def отобрать_аккаунты(все, разрешено=""):
+    u"""(рабочие, отключенные) аккаунты Postmypost с учетом списка разрешенных.
+
+    🔴 27.09: подключить аккаунт в кабинете сервиса еще не значит решить, что туда
+    идут ролики. Владелец подключил foxlik_for_kids и TikTok, а такт публиковал на
+    все подключенные - ролики Ксении ушли бы в непроверенный TikTok и в аккаунт,
+    где идет тест. `разрешено` - id через запятую (POSTMYPOST_ACCOUNTS); пусто -
+    как раньше, все подключенные.
+    🔴 Отключенный аккаунт - не «его нет», а «сегодня он не в эфире». Разница видна
+    только сравнением полного списка с рабочим, и без нее потеря канала проходит
+    молча (случай 04.09, Instagram). Неразрешенный же - не отключенный: о нем молчим.
+    """
+    ids = set(x.strip() for x in str(разрешено or "").split(",") if x.strip())
+    свои = [a for a in все if not ids or str(a.get("id")) in ids]
+    return ([a for a in свои if a.get("connection_status") == 1],
+            [a for a in свои if a.get("connection_status") != 1])
 
 
 def main():

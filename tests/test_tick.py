@@ -1356,5 +1356,27 @@ def selftest():
           "а день эфира берется из ПЛАНА, а не из дня одобрения")
 
 
+def test_accounts_allowlist():
+    # 🔴 27.09: владелец подключил в Postmypost foxlik_for_kids и TikTok, а такт
+    # публиковал на ВСЕ подключенные аккаунты - ролики Ксении ушли бы туда сами,
+    # в непроверенный TikTok и в аккаунт, на котором идет тест «еще раз».
+    все = [{"id": 1, "name": "myplayroom_shop", "connection_status": 1},
+           {"id": 2, "name": "FOXLIK", "connection_status": 1},
+           {"id": 3, "name": "foxlik_for_kids", "connection_status": 1},
+           {"id": 4, "name": "foxlikkids", "connection_status": 1},
+           {"id": 5, "name": "старый", "connection_status": 0}]
+    рабочие, отпавшие = T.отобрать_аккаунты(все, "1, 2,5")
+    assert [a["id"] for a in рабочие] == [1, 2], рабочие
+    assert [a["id"] for a in отпавшие] == [5], u"разрешенный, но отпавший - слышен"
+    # не разрешенный аккаунт - не «отвалился»: тревоги о нем быть не должно
+    рабочие, отпавшие = T.отобрать_аккаунты(все, "1")
+    assert [a["id"] for a in рабочие] == [1] and отпавшие == [], отпавшие
+    # без списка - как раньше, все подключенные
+    рабочие, отпавшие = T.отобрать_аккаунты(все, "")
+    assert len(рабочие) == 4 and [a["id"] for a in отпавшие] == [5]
+    print("tick: аккаунты публикации берутся из списка разрешенных")
+
+
 if __name__ == "__main__":
     selftest()
+    test_accounts_allowlist()

@@ -101,6 +101,9 @@ jobs:
           # тут нет, такт в облаке работает вхолостую: приемка идет, эфира нет.
           POSTMYPOST_TOKEN: ${{ secrets.POSTMYPOST_TOKEN }}
           POSTMYPOST_PROJECT_ID: ${{ secrets.POSTMYPOST_PROJECT_ID }}
+          # 🔴 27.09: куда идут ролики, решает этот список id, а не факт подключения
+          # аккаунта в кабинете сервиса (tick.отобрать_аккаунты).
+          POSTMYPOST_ACCOUNTS: ${{ secrets.POSTMYPOST_ACCOUNTS }}
         run: |
           for i in $(seq 1 11); do
             echo "--- такт $i из 11 ---"
