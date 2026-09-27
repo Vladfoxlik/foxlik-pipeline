@@ -121,7 +121,9 @@ class Postmypost:
                 raise PublishError("загрузка %s: ошибка на стороне сервиса (%s)"
                                    % (upload_id, r))
             self._sleep(POLL_EVERY)
-        raise PublishError("загрузка %s не дозрела за отведенное время" % upload_id)
+        # 🔴 Не PublishError: замер 27.09, W39-06 получил на этом терминальную
+        # ОШИБКУ и не вышел. Публикации еще нет, поэтому повтор безопасен.
+        raise UploadError("загрузка %s не дозрела за отведенное время" % upload_id)
 
     def upload_from_url(self, url):
         """Вариант B: сервис скачивает сам, до 1 ГБ. /upload/complete тут не нужен."""

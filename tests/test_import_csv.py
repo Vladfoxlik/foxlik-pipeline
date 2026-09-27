@@ -195,6 +195,26 @@ def selftest():
     assert pubs.rows[0]["Медиа ID"] == "18123456789", "настоящий media id обязан дозаписаться: %r" % pubs.rows[0]
     assert mets.rows and mets.rows[0]["ID"] == "W36-01", mets.rows
 
+    # --- 🔴 21.09: живые ссылки разной формы - /p/ у такта, /reel/ в выгрузке ---
+    # Тест выше брал одну форму на обоих концах, а живой такт пишет
+    # «instagram.com/p/КОД», выгрузка - «instagram.com/reel/КОД/». Связь молчала,
+    # импорт завел 21 двойника, и ни один ролик W36-W37 не дошел до своей строки.
+    pubs = FakeSheet([{"ID": "W37-14", "Дата": "2026-09-20",
+                       "Площадка": "instagram",
+                       "Ссылка": "https://www.instagram.com/p/DdhLtiEDlxr",
+                       "Медиа ID": "pmp:32300001", "Механика": "мама"}])
+    mets = FakeSheet()
+    выгрузка = HEAD + ('"18137828881617719","1","%s","FOXLIK","Ему полтора",'
+                       '"15","09/20/2026 11:02",'
+                       '"https://www.instagram.com/reel/DdhLtiEDlxr/",'
+                       '"Reels в Instagram","","За всё время",3159,2500,5,0,1,0,2\n'
+                       % OUR)
+    stats = I.load(read(выгрузка), pubs, mets, report=True)
+    assert stats["новых"] == 0, "/p/ и /reel/ с одним кодом - один ролик: %r" % stats
+    assert len(pubs.rows) == 1, pubs.rows
+    assert pubs.rows[0]["Медиа ID"] == "18137828881617719", pubs.rows[0]
+    assert mets.rows and mets.rows[0]["ID"] == "W37-14", mets.rows
+
     # --- дата берется из «Время публикации», а не «За всё время» -----------
     # 🔴 Живая выгрузка в колонке «Дата» несет «За всё время» у всех строк;
     # настоящая дата - в «Время публикации» по-американски (MM/DD/YYYY).

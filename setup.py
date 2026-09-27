@@ -17,6 +17,7 @@
 угадать их нельзя. Поэтому по СДАЧАМ скрипт только **дописывает недостающие** колонки
 статуса справа от того, что уже есть, и вслух говорит, что увидел.
 """
+import csv
 import os
 import re
 import sys
@@ -122,8 +123,11 @@ def read_plan(path):
     все съехало на колонку влево - и заливка отчиталась «добавлено 15».
     Испорченные данные с отчетом об успехе хуже отказа: отказ виден сразу.
     """
-    with open(path, encoding="utf-8-sig") as f:
-        rows = [line.rstrip("\n").split("\t") for line in f if line.strip()]
+    # 🔴 Настоящий разбор TSV, а не построчный split: с 20.09 подпись к посту
+    # собирается по мосту и содержит абзацы внутри ячейки. Построчное чтение
+    # видело в одной строке плана три и роняло заливку.
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rows = [r for r in csv.reader(f, delimiter="\t") if any(c.strip() for c in r)]
     if not rows:
         raise SystemExit("файл плана пуст: %s" % path)
     head = [c.strip() for c in rows[0]]
@@ -166,11 +170,29 @@ def form_options(plan):
     return out
 
 
+def sheet_id(окружение=None, из_файла=None):
+    """Id рабочей таблицы: сперва окружение, затем `.env` рядом с репозиторием.
+
+    🔴 Раньше бралось только из окружения, и локальный запуск заливки падал
+    со словами «нет переменной SHEET_ID», хотя ключ лежал в `.env` и выдача
+    креаторам его оттуда читала. Два скрипта одного конвейера вели себя
+    по-разному на одной машине.
+    """
+    окружение = os.environ if окружение is None else окружение
+    значение = (окружение.get("SHEET_ID") or "").strip()
+    if значение:
+        return значение
+    if из_файла is None:
+        from handout import read_env
+        из_файла = read_env()
+    return (из_файла.get("SHEET_ID") or "").strip()
+
+
 def make_book():
     sa = google_auth.ServiceAccount.load()
-    sid = os.environ.get("SHEET_ID")
+    sid = sheet_id()
     if not sid:
-        raise SystemExit("нет переменной SHEET_ID")
+        raise SystemExit("нет SHEET_ID: ни в окружении, ни в .env")
     return sheets.Book(sa, sid)
 
 

@@ -33,6 +33,9 @@ _SECRETS = [
 RETRY_WAIT = (2, 5)                       # пауза перед 2-й и 3-й попыткой, секунды
 TRANSIENT_HTTP = (429, 500, 502, 503, 504)
 _SAFE_METHODS = ("GET", "HEAD")
+# 429 - «слишком часто», отказ ДО выполнения (RFC 6585), поэтому повторяется у любого
+# метода, но с паузой под минутную квоту Google (60 записей в минуту). Замер 21.09.
+QUOTA_WAIT = (30, 60, 60)
 # точки подмены для проверок: сеть и сон без настоящих вызовов
 _urlopen = urllib.request.urlopen
 _sleep = time.sleep
@@ -62,20 +65,27 @@ def _with_retry(req, timeout, read):
     """
     повторять = req.get_method() in _SAFE_METHODS
     паузы = (0,) + RETRY_WAIT
-    for i, пауза in enumerate(паузы):
+    квота = list(QUOTA_WAIT)
+    i = 0
+    while True:
         последняя = i == len(паузы) - 1
-        if пауза:
-            _sleep(пауза)
+        if паузы[i]:
+            _sleep(паузы[i])
         try:
             with _urlopen(req, timeout=timeout) as r:
                 return read(r)
         except urllib.error.HTTPError as e:
+            if e.code == 429 and квота:
+                _sleep(квота.pop(0))          # отказ до выполнения: повтор безопасен
+                continue
             if повторять and e.code in TRANSIENT_HTTP and not последняя:
+                i += 1
                 continue
             raise HttpError(e.code, e.read().decode("utf-8", "replace"), req.full_url)
         except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout,
                 http.client.HTTPException):
             if повторять and not последняя:
+                i += 1
                 continue
             raise
 
@@ -211,6 +221,39 @@ def selftest():
         except HttpError as e:
             assert e.status == 403, e
         assert len(вызовы) == 1, u"403 повторился: %s" % вызовы
+
+        # 🔴 21.09: 429 повторяется и у ЗАПИСИ, с паузой под минутную квоту.
+        # Импорт метрик писал в лист МЕТРИКИ быстрее 60 запросов в минуту, Google
+        # отвечал 429, и каждый перезапуск падал раньше, чем доходил до новых строк.
+        # 429 - отказ до выполнения (RFC 6585), двойной записи он не дает.
+        del вызовы[:]
+        паузы = []
+
+        def квота_дважды(req, timeout=None):
+            вызовы.append(req.get_method())
+            if len(вызовы) < 3:
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
+            return _FakeResponse(b'{"ok": true}')
+
+        _urlopen, _sleep = квота_дважды, паузы.append
+        assert request("https://x/y", method="POST", raw_body=b"{}") == {"ok": True}
+        assert вызовы == ["POST"] * 3, вызовы
+        assert паузы and min(паузы) >= 20, u"пауза меньше минутной квоты: %s" % паузы
+
+        # а 503 у записи по-прежнему не повторяется: сервис мог успеть записать
+        del вызовы[:]
+
+        def сбой(req, timeout=None):
+            вызовы.append(req.get_method())
+            raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, None)
+
+        _urlopen = сбой
+        try:
+            request("https://x/y", method="POST", raw_body=b"{}")
+            assert False, u"503 записи обязан подниматься наверх"
+        except HttpError as e:
+            assert e.status == 503
+        assert вызовы == ["POST"], u"запись при 503 повторилась: %s" % вызовы
     finally:
         _urlopen, _sleep = настоящие
     print("http selftest OK: строка запроса, разбор ответа, multipart, повтор чтения "

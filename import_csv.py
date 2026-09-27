@@ -34,6 +34,7 @@
 """
 import csv
 import io
+import re
 import os
 import sys
 
@@ -158,6 +159,19 @@ def main_account(rows):
     return max(counts, key=counts.get) if counts else ""
 
 
+def post_code(link):
+    """Код поста из ссылки Instagram: «instagram.com/p/КОД» и «/reel/КОД/» - один пост.
+
+    🔴 21.09: такт пишет ссылку через /p/, выгрузка Business Suite - через /reel/
+    со слешем в конце. Сравнение ссылок целиком не совпадало никогда, и импорт
+    завел 21 двойника вместо того, чтобы узнать ролики W36-W37.
+    Ссылка не про Instagram возвращается как есть, без хвостового слеша.
+    """
+    link = (link or "").strip()
+    m = re.search(r"instagram\.com/(?:p|reels?|tv)/([^/?#]+)", link)
+    return m.group(1) if m else link.rstrip("/")
+
+
 def load(rows, pubs, metrics, report=False, account=None):
     """Заливка в листы. Возвращает число новых роликов либо сводку.
 
@@ -182,7 +196,7 @@ def load(rows, pubs, metrics, report=False, account=None):
         if media:
             known_pub[media] = row
             id_by_media[media] = (row.get("ID") or "").strip() or media
-        link = (row.get("Ссылка") or "").strip().rstrip("/")
+        link = post_code(row.get("Ссылка"))
         if link:
             known_link[link] = row
 
@@ -210,7 +224,7 @@ def load(rows, pubs, metrics, report=False, account=None):
             # НИКОГДА, и каждый ролик конвейера плодил двойника без механики:
             # словарь получал ноль. Запасная связь - постоянная ссылка поста
             # (заявлена в шапке модуля с 28.08, написана только сейчас).
-            наш = known_link.get((item.get("link") or "").strip().rstrip("/"))
+            наш = known_link.get(post_code(item.get("link")))
             if наш is not None:
                 our_id = (наш.get("ID") or "").strip() or media
                 known_pub[media] = наш
