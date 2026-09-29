@@ -10,6 +10,7 @@ u"""Упаковка поста под каждую площадку. Сеть �
 и добавление площадки не требует правки программы.
 """
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -197,6 +198,31 @@ def selftest():
                       rules=с_тикток, товар="световой стол",
                       hashtags=теги)[0]["content"]
     assert "#" not in инста, инста
+
+    # --- 🔴 Instagram: сайт со скидкой и WB (владелец 29.09) ---------------
+    # Слова владельца: «в Instagram артикул WB + сайт, заказывайте со скидкой на сайте
+    # FOXLIK.RU». Ozon и подсказка про шапку уходят: низ подписи - сайт и WB.
+    # У TikTok свои слова (27.09) и они не меняются.
+    с_инстой = P.read_rules(io.StringIO(
+        ПРАВИЛА.replace(u"instagram\t1\tнет\t2200\t30\tартикул",
+                        u"instagram\t1\tнет\t2200\t30\tсайт")
+        + "tiktok\t9\tнет\t2200\t5\tсайт, хештеги\ttiktok_privacy_status=1\tнет\tзамер\n"))
+    assert с_инстой[1]["добавлять"] == u"сайт", u"замена в образце правил не сработала"
+    ig = P.details(АККАУНТЫ[1:2], ТЕКСТ, артикул="43287163", file_ids=[7],
+                   rules=с_инстой, ozon="646406042", товар="световой стол",
+                   hashtags=теги)[0]
+    assert ig["content"] == ТЕКСТ + (u"\n\n🛒 Заказывайте со скидкой на сайте FOXLIK.RU"
+                                     u"\nили на WB, артикул 43287163"), ig["content"]
+    assert ig.get("instagram_share_to_feed") is True, u"поля площадки на месте"
+    тт2 = P.details(тикток_акк, ТЕКСТ, артикул="43287163", file_ids=[7],
+                    rules=с_инстой, товар="световой стол", hashtags=теги)[0]["content"]
+    assert u"Заказать выгодно на сайте FOXLIK.RU" in тт2, тт2
+    # живой справочник: правило Instagram в data/площадки.tsv - именно «сайт»
+    живые = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         os.pardir, os.pardir, "data", u"площадки.tsv")
+    if os.path.exists(живые):
+        with open(живые, encoding="utf-8-sig") as f:
+            assert P.read_rules(f)[1]["добавлять"] == u"сайт", u"data/площадки.tsv не обновлен"
 
     # --- 🔴 артикул, вписанный в описание руками, не дублируется -----------
     # Замер 27.09 на живом W39-10: в плане W39 стояло «🛒 Артикул на WB: #43287163»,
