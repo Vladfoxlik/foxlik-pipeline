@@ -1447,7 +1447,161 @@ def test_routing():
     print("tick: у строки плана свои аккаунты и время, второй Instagram отдельной площадкой")
 
 
+class FailSheet(FakeSheet):
+    def read(self):
+        raise RuntimeError("Google не ответил")
+
+
+def reserve_case(rows=(), pubs_rows=(), reserve_rows=None, plan_rows=None, hour=17, minute=40):
+    """Такт на 17:40 дня TODAY: ПЛАН с двумя строками дня, запасные R1-01, R1-02 - в листе ЗАПАС.
+
+    🔴 Ревью 03.10: подпись и товар запасного живут в листе ЗАПАС (так в ТЗ), а не в ПЛАНЕ:
+    перезаливка плана (`setup.py --replan`) стирала бы их молча.
+    """
+    день = TODAY.isoformat()
+    plan_rows = plan_rows if plan_rows is not None else [
+        {"ID": "W40-09", "Механика": "мама", "Описание к посту": "один", "Дата в эфир": день},
+        {"ID": "W40-10", "Механика": "мама", "Описание к посту": "два", "Дата в эфир": день}]
+    if reserve_rows is None:
+        reserve_rows = [{"№": "R1-01", "Файл": "linkR1", "Откуда": "DWwDV2tiITq",
+                         "Статус": "готов", "Подпись": "запасной текст", "Товар": "световой стол"},
+                        {"№": "R1-02", "Файл": "linkR2", "Откуда": "Da283OfK6ft",
+                         "Статус": "готов", "Подпись": "второй запасной", "Товар": ""}]
+    pmp = FakePmp()
+    pipe, sheet = build(list(rows), plan=FakeSheet(list(plan_rows)), pmp=pmp,
+                        accounts=PMP_ACCOUNTS, pubs_rows=list(pubs_rows))
+    pipe.settings = FakeSheet([])
+    pipe.reserve = reserve_rows if isinstance(reserve_rows, FakeSheet) else FakeSheet(reserve_rows)
+    pipe.now = datetime.datetime.combine(TODAY, datetime.time(hour, minute), tzinfo=T.MSK)
+    return pipe, sheet, pmp
+
+
+def test_reserve():
+    """В58, 03.10: эфир вышел пустым - креатор не сдал оба ролика дня."""
+    день = TODAY.isoformat()
+    # 1. пустой день к 17:40 -> одна запасная публикация, R1-01 использован, владельцу сказано
+    pipe, sheet, pmp = reserve_case()
+    pipe.run()
+    assert len(pmp.posted) == 1, pmp.posted
+    assert u"запасной текст" in pmp.posted[0][1], pmp.posted[0][1]
+    assert sorted(pmp.posted[0][2]) == [2248535, 2248551], u"как обычный ролик"
+    новые = [r for r in sheet.rows if str(r.get(T.COL_PLAN, "")).startswith("R1-01")]
+    assert len(новые) == 1 and u"W40-09, W40-10" in новые[0][T.COL_PLAN], новые
+    r1, r2 = pipe.reserve.rows
+    assert r1["Статус"] == T.RESERVE_USED and r1["Дата"] == день \
+        and r1["Вместо"] == "W40-09, W40-10", r1
+    assert r2["Статус"] == T.RESERVE_READY
+    assert any(u"R1-01" in n and u"W40-09" in n for n in pipe.bot.notes), pipe.bot.notes
+    # 🔴 ревью 03.10: окно 18:00 каждый день, а не 21:00 через день (TODAY - нечетный день)
+    assert pmp.posted[0][3].startswith(день + "T18:"), pmp.posted[0][3]
+    # товар запасного берется из листа ЗАПАС - хвост с артикулом на месте
+    assert u"43287163" in pmp.posted[0][1] or any(
+        u"43287163" in str(d) for d in (pmp.posted[0][5] or [])), pmp.posted[0]
+    # 3. второй такт того же дня второй запасной не ставит
+    pipe.run()
+    assert len(pmp.posted) == 1 and pipe.reserve.rows[1]["Статус"] == T.RESERVE_READY
+
+    # до 17:30 - ничего
+    pipe, sheet, pmp = reserve_case(hour=17, minute=0)
+    pipe.run()
+    assert not pmp.posted and pipe.reserve.rows[0]["Статус"] == T.RESERVE_READY
+
+    # 2. в учете на сегодня уже стоит ролик (ручной повтор З11) - запас не трогаем
+    pipe, sheet, pmp = reserve_case(pubs_rows=[{"ID": "Z11-03", "Дата": день,
+                                                "Площадка": "instagram", "Медиа ID": "pmp:9"}])
+    pipe.run()
+    assert not pmp.posted and pipe.reserve.rows[0]["Статус"] == T.RESERVE_READY
+
+    # 2. ролик креатора одобрен на сегодня - выходит он, запас не трогаем
+    pipe, sheet, pmp = reserve_case(rows=[row(status=T.APPROVED, date=день,
+                                              plan="W40-09 · Ксения")])
+    pipe.run()
+    assert len(pmp.posted) == 1 and u"один" in pmp.posted[0][1], pmp.posted
+    assert pipe.reserve.rows[0]["Статус"] == T.RESERVE_READY
+
+    # Review Focus 1: одобрен на ЗАВТРА - сегодня пусто, запасной выходит
+    завтра = (TODAY + datetime.timedelta(days=1)).isoformat()
+    pipe, sheet, pmp = reserve_case(rows=[row(status=T.APPROVED, date=завтра,
+                                              plan="W40-11 · Ксения")])
+    pipe.run()
+    assert len(pmp.posted) == 1 and u"запасной" in pmp.posted[0][1], pmp.posted
+
+    # Review Focus 2: учет не прочитался - не решаем и отметку не ставим
+    pipe, sheet, pmp = reserve_case()
+    pipe.pubs = FailSheet([])
+    pipe.run()
+    assert not pmp.posted and pipe.reserve.rows[0]["Статус"] == T.RESERVE_READY
+    assert not any(r.get("Ключ") == T.KEY_RESERVE for r in pipe.settings.rows)
+
+    # Review Focus 3: строка без файла, без подписи или с номером, который такт не узнает,
+    # пропускается и НЕ сгорает; «Готов » читается (ревью 03.10, Important 3)
+    pipe, sheet, pmp = reserve_case(reserve_rows=[
+        {"№": "R1-01", "Файл": "", "Откуда": "x", "Статус": "готов", "Подпись": "п"},
+        {"№": "R1-05", "Файл": "l5", "Откуда": "x", "Статус": "готов", "Подпись": ""},
+        {"№": "R-07", "Файл": "l7", "Откуда": "x", "Статус": "готов", "Подпись": "п"},
+        {"№": "R1-02", "Файл": "linkR2", "Откуда": "y", "Статус": " Готов ",
+         "Подпись": "второй запасной"}])
+    pipe.run()
+    assert len(pmp.posted) == 1 and u"второй" in pmp.posted[0][1], pmp.posted
+    assert [r["Статус"] for r in pipe.reserve.rows[:3]] == ["готов"] * 3, pipe.reserve.rows
+
+    # 🔴 ревью 03.10, Important 2а: одобренная строка, которую такт выпустить не может
+    # (нет подписи в ПЛАНЕ - отложена навсегда), день не занимает
+    вчера = (TODAY - datetime.timedelta(days=1)).isoformat()
+    pipe, sheet, pmp = reserve_case(rows=[row(status=T.APPROVED, date=вчера,
+                                              plan="X9-01 · нет в плане")])
+    pipe.run()
+    assert len(pmp.posted) == 1 and u"запасной" in pmp.posted[0][1], pmp.posted
+
+    # 🔴 ревью 03.10, Important 2б: ролик дня упал в публикации - следующий такт ставит запасной
+    class ДискБезРолика(FakeDrive):
+        def fetch(self, link, max_mb=None):
+            if link == "link1":
+                raise RuntimeError("Диск не отдал файл")
+            return FakeDrive.fetch(self, link, max_mb)
+    pipe, sheet, pmp = reserve_case(rows=[row(status=T.APPROVED, date=день,
+                                              plan="W40-09 · Ксения")])
+    pipe.disk = ДискБезРолика()
+    pipe.run()
+    assert not pmp.posted and sheet.rows[0][T.COL_STATUS] == T.FAILED, sheet.rows[0]
+    pipe.now = datetime.datetime.combine(TODAY, datetime.time(18, 30), tzinfo=T.MSK)
+    pipe.run()
+    assert len(pmp.posted) == 1 and u"запасной" in pmp.posted[0][1], pmp.posted
+
+    # 🔴 ревью 03.10, Minor 1: строка СДАЧИ не записалась - запасной не сгорает, день открыт
+    class СдачиНеПишутся(FakeSheet):
+        def append(self, values):
+            raise RuntimeError("Google не принял строку")
+    pipe, sheet, pmp = reserve_case()
+    pipe.sheet = СдачиНеПишутся([])
+    pipe.run()
+    assert pipe.reserve.rows[0]["Статус"] == T.RESERVE_READY, pipe.reserve.rows[0]
+    assert not any(r.get("Ключ") == T.KEY_RESERVE and r.get("Значение") == день
+                   for r in pipe.settings.rows), pipe.settings.rows
+
+    # Review Focus 4: неделя не загружена - запасной выходит «вместо пустого дня»
+    pipe, sheet, pmp = reserve_case(plan_rows=[])
+    pipe.run()
+    assert len(pmp.posted) == 1
+    assert any(u"пустого дня" in str(r.get(T.COL_PLAN, "")) for r in sheet.rows), sheet.rows
+
+    # 4. запас пуст - тревога, такт не падает
+    pipe, sheet, pmp = reserve_case(reserve_rows=[{"№": "R1-01", "Файл": "l",
+                                                   "Статус": "использован"}])
+    pipe.run()
+    assert not pmp.posted and any(u"запас пуст" in n for n in pipe.bot.notes), pipe.bot.notes
+
+    # Review Focus 5 (ревью 03.10, Important 4): лист ЗАПАС не читается - такт не падает,
+    # ложного «запас пуст» нет, отметки нет: следующий такт попробует снова
+    pipe, sheet, pmp = reserve_case(reserve_rows=FailSheet([]))
+    pipe.run()
+    assert not pmp.posted and not any(u"запас пуст" in n for n in pipe.bot.notes), pipe.bot.notes
+    assert not any(r.get("Ключ") == T.KEY_RESERVE for r in pipe.settings.rows)
+    print("tick: пустой день закрыт одним запасным, полный день и сбой учета запас не трогают")
+
+
 if __name__ == "__main__":
     selftest()
     test_accounts_allowlist()
     test_routing()
+    test_reserve()

@@ -183,7 +183,9 @@ class Pipeline:
     def __init__(self, bot, sheet, pubs, disk, ig=None, vkontakte=None, cloud=None,
                  today=None, plan=None, pmp=None, pmp_accounts=(), pmp_offline=(),
                  вхолостую=False, group_chat_id=None, settings=None, now=None,
-                 chat_log=None):
+                 chat_log=None, reserve=None):
+        # 🔴 В58, 03.10: лист ЗАПАС - страховка пустого дня. Нет листа - страховка молчит.
+        self.reserve = reserve
         # 🔴 В50, 17.09: лист ПЕРЕПИСКА - архив сообщений людей боту и в группу.
         # Историю чата Bot API не отдает, подтвержденный пакет стирается.
         self.chat_log = chat_log
@@ -403,6 +405,107 @@ class Pipeline:
         резерв = min(резерв, max(0, len(ОКНА_ДНЯ) - занято))
         return занято + резерв < len(ОКНА_ДНЯ) + 1
 
+    def _has_content_today(self, rows):
+        """Есть ли сдача, которую такт РЕАЛЬНО выпустит сегодня.
+
+        🔴 Ревью 03.10: раньше хватало статуса «в работе», и одобренная строка без
+        подписи в ПЛАНЕ (pick_due откладывает ее навсегда) глушила запас каждый день.
+        Считается только то, что pick_due может выпустить: дата читается и не позже
+        сегодня, подпись есть. Уже публикуемая строка считается всегда.
+        """
+        self._load_plan()
+        for r in rows:
+            статус = status_of(r)
+            if статус == PUBLISHING:
+                return True
+            if статус != APPROVED:
+                continue
+            raw = (r.get(COL_DATE) or "").strip()
+            день = _as_date(raw)
+            if raw and день is None:
+                continue
+            день = день or self._air_dates.get(self.plan_key(r.get(COL_PLAN)))
+            if (день is None or день <= self.today) and self.caption_of(r):
+                return True
+        return False
+
+    def cover_empty_day(self, rows):
+        """В58: пустой день к 17:30 закрывается одним роликом из листа ЗАПАС.
+
+        🔴 03.10 эфир вышел пустым: креатор не сдал оба ролика, а у такта были только
+        предупреждения. Запасной идет штатным путем: такт дописывает за него строку
+        СДАЧИ, дальше pick_due и publish - упаковка, аккаунты, окна и учет те же.
+        🔴 Учет не прочитался - не решаем: ложный запасной хуже позднего.
+        🔴 Отметка дня ставится ДО действия: сбой после нее дает пропуск, а не двойной эфир.
+        Возвращает True, когда строка СДАЧИ добавлена (вызывающий перечитает лист).
+        """
+        if self.reserve is None or self.settings is None:
+            return False
+        now = self.now or datetime.datetime.now(MSK)
+        if now.time() < RESERVE_FROM:
+            return False
+        сегодня = self.today.isoformat()
+        marks = reports.read_marks(self.settings)
+        отметка = marks.get(KEY_RESERVE)
+        if отметка and str(отметка.get("Значение") or "").strip() == сегодня:
+            return False
+        занято = self._taken(self.today)
+        if занято is None:
+            return False
+        # 🔴 Ревью 03.10: на непустом дне отметку НЕ ставим. Ролик дня может упасть
+        # в публикации после 17:30, и тогда следующий такт обязан закрыть день.
+        if занято > 0 or self._has_content_today(rows):
+            return False
+        вместо = ", ".join(sorted(k for k, d in self._air_dates.items() if d == self.today))
+        try:
+            запас = self.reserve.read()
+        except Exception as e:
+            # 🔴 Ревью 03.10: разовый сбой чтения не равен «запас пуст» - молчим
+            # и ждем такта, как с учетом; сводка 20:00 скажет, если лист не читается
+            self.say("лист ЗАПАС не прочитался, страховка ждет такта: %s"
+                     % http.mask(str(e))[:120])
+            return False
+        готов, мимо = [], []
+        for r in запас:
+            if str(r.get("Статус") or "").strip().lower() != RESERVE_READY:
+                continue
+            номер = str(r.get("№") or "").strip()
+            if (self.PLAN_ID.match(номер) and str(r.get(COL_FILE) or "").strip()
+                    and str(r.get("Подпись") or "").strip()):
+                готов.append(r)
+            else:
+                мимо.append(номер or "без номера")
+        if мимо:
+            self.say("в ЗАПАСЕ пропущены (нет файла, подписи или номер не вида R1-01): %s"
+                     % ", ".join(мимо))
+        if not готов:
+            reports.put_mark(self.settings, marks, KEY_RESERVE, сегодня)
+            self.bot.notify("🔴 Пустой день %s: ни один ролик не пришел (%s), а запас пуст. "
+                            "Эфира сегодня не будет - пополните лист ЗАПАС."
+                            % (_short_date(сегодня), вместо or "в плане пусто"))
+            self.say("пустой день, запас пуст")
+            return False
+        r = готов[0]
+        номер = str(r.get("№")).strip()
+        reports.put_mark(self.settings, marks, KEY_RESERVE, сегодня)
+        try:
+            self.sheet.append({COL_TIME: now.strftime("%d.%m.%Y %H:%M:%S"),
+                               COL_PLAN: "%s · запас вместо %s" % (номер, вместо or "пустого дня"),
+                               COL_FILE: str(r.get(COL_FILE)).strip(), COL_COMMENT: "запас",
+                               COL_STATUS: APPROVED, COL_DATE: сегодня, COL_REASON: ""})
+        except Exception:
+            # 🔴 Ревью 03.10: строка не легла - день открыт снова, запасной не сгорает
+            reports.put_mark(self.settings, marks, KEY_RESERVE, "")
+            raise
+        self.reserve.set_many(r["_row"], {"Статус": RESERVE_USED, "Дата": сегодня,
+                                          "Вместо": вместо})
+        self.bot.notify("🛟 Пустой день %s: ни один ролик не пришел (%s). Ставлю запасной %s "
+                        "(оригинал %s), выйдет в ближайшее окно."
+                        % (_short_date(сегодня), вместо or "в плане пусто", номер,
+                           r.get("Откуда") or "?"))
+        self.say("пустой день: поставлен запасной %s" % номер)
+        return True
+
     def route_of(self, plan_id):
         """(аккаунты, отключенные, неизвестные имена, время) для строки плана.
 
@@ -536,6 +639,32 @@ class Pipeline:
                                    % http.mask(str(e))[:200])
         else:
             self.warn_mechanic("такту не передан лист ПЛАН")
+        self._load_reserve_rows()
+
+    def _load_reserve_rows(self):
+        """В58: строки листа ЗАПАС как строки плана - подпись, товар, время 18:03.
+
+        🔴 Ревью 03.10: подпись и товар запасного живут в листе ЗАПАС (так в ТЗ).
+        В ПЛАНЕ их стирала бы перезаливка недели, и запасной уходил бы в «нет описания».
+        Строка ПЛАНА с тем же номером главнее - ее писал человек.
+        """
+        if self.reserve is None:
+            return
+        try:
+            запас = self.reserve.read()
+        except Exception as e:
+            self.say("лист ЗАПАС не прочитался: %s" % http.mask(str(e))[:120])
+            return
+        for r in запас:
+            key = str(r.get("№") or "").strip()
+            if not key or self._captions.get(key):
+                continue
+            self._captions[key] = str(r.get("Подпись") or "").strip()
+            self._mechanics[key] = "запас"
+            self._creators[key] = "запас"
+            self._routes[key] = ([], RESERVE_TIME)
+            товар = str(r.get("Товар") or "").strip()
+            self._axes[key] = {"Товар": товар} if товар else {}
 
     def warn_mechanic(self, why):
         """Пропажа механики обязана быть слышной, но лог публичный.
@@ -1216,7 +1345,7 @@ class Pipeline:
                                 group_chat_id=self.group_chat_id,
                                 key_of=self.plan_key,
                                 now=self.now or datetime.datetime.now(MSK),
-                                say=self.say).run()
+                                say=self.say, reserve=self.reserve).run()
             except Exception as e:
                 self.say("отчеты упали: %s" % http.mask(str(e))[:120])
         try:
@@ -1229,6 +1358,12 @@ class Pipeline:
             self.resend(rows)
         except Exception as e:
             self.say("досыл упал: %s" % http.mask(str(e))[:120])
+        # 🔴 В58: страховка пустого дня под своим зонтиком - ее сбой не отменяет эфир
+        try:
+            if self.cover_empty_day(rows):
+                rows = self.sheet.read()
+        except Exception as e:
+            self.say("страховка пустого дня упала: %s" % http.mask(str(e))[:120])
         due = self.pick_due(rows)
         if not due:
             self.say("публиковать нечего")
@@ -1346,6 +1481,16 @@ def post_at_now(now=None):
 # (пик Mediascope 20-23, наш 20:00 ×1,96 на 4 роликах). Плановые окна им не отдаются.
 ОКНО_ОПОЗДАВШИХ = datetime.time(19, 30)
 
+# В58, 03.10: страховка пустого дня. Решения владельца 03.10: один запасной в день,
+# площадки как у обычного ролика, проверка с 17:30 (окно 18:00 еще впереди).
+RESERVE_FROM = datetime.time(17, 30)
+# 🔴 Ревью 03.10: по окнам дня запасной вставал в 21:00 через день (порядок окон
+# чередуется по дате). Свое время у строки - как у повторов З11: окна мимо.
+RESERVE_TIME = datetime.time(18, 3)
+KEY_RESERVE = "ЗАПАС_ДЕНЬ"
+RESERVE_READY = "готов"
+RESERVE_USED = "использован"
+
 
 def day_slots(plan_rows):
     """plan_id -> (номер внутри дня, всего в дне) по колонке «Дата в эфир».
@@ -1446,6 +1591,8 @@ def from_env():
         # 🔴 Лист ПЛАН нужен ради одной колонки - «Механика». Без него ролик
         # уходит в учет обезличенным и выпадает из памяти петли.
         plan=sheets.Sheet(sa, sid, SHEET_PLAN),
+        # 🔴 В58: лист ЗАПАС - страховка пустого дня; его нет - страховка молчит
+        reserve=sheets.Sheet(sa, sid, "ЗАПАС"),
         disk=drive.Drive(sa), ig=ig, vkontakte=vkontakte, cloud=cloud,
         pmp=pmp, pmp_accounts=pmp_accounts, pmp_offline=pmp_offline,
         # 🔴 Холостой прогон включается переменной среды, а не флагом командной

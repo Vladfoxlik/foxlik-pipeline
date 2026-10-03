@@ -40,6 +40,23 @@ SUBMITTED = ("ПРИНЯТ", "НА_ПРИЕМКЕ", "ОДОБРЕН", "ПУБЛ�
 PUBLISHED = ("ПУБЛИКУЕТСЯ", "ОПУБЛИКОВАН")
 FAILED = "ОШИБКА"
 APPROVED = "ОДОБРЕН"
+RESERVE_READY = "готов"     # то же слово, что в tick.py (импорт оттуда дал бы цикл)
+
+
+def read_marks(settings):
+    """Отметки листа НАСТРОЙКИ: {ключ: строка}. Общие для отчетов и запаса (В58)."""
+    return dict((str(r.get("Ключ") or "").strip(), r) for r in settings.read())
+
+
+def put_mark(settings, marks, key, value):
+    строка = marks.get(key)
+    if строка:
+        settings.set(строка["_row"], "Значение", value)
+    else:
+        settings.append({"Ключ": key, "Значение": value})
+        # следующая отметка в том же такте должна найти строку, а не дописать вторую
+        marks[key] = None
+        marks.update(read_marks(settings))
 
 
 def _status(row):
@@ -52,7 +69,8 @@ def _dm(day):
 
 class Reports:
     def __init__(self, plan, subs, pubs, settings, bot, group_chat_id, key_of, now,
-                 say=print):
+                 say=print, reserve=None):
+        self.reserve = reserve      # лист ЗАПАС (В58); нет - строки об остатке нет
         self.plan = plan
         self.subs = subs
         self.pubs = pubs
@@ -68,17 +86,10 @@ class Reports:
     # ---------- отметки ----------
 
     def _marks(self):
-        return dict((str(r.get("Ключ") or "").strip(), r) for r in self.settings.read())
+        return read_marks(self.settings)
 
     def _mark(self, marks, key, value):
-        строка = marks.get(key)
-        if строка:
-            self.settings.set(строка["_row"], "Значение", value)
-        else:
-            self.settings.append({"Ключ": key, "Значение": value})
-            # следующая отметка в том же такте должна найти строку, а не дописать вторую
-            marks[key] = None
-            marks.update(self._marks())
+        put_mark(self.settings, marks, key, value)
 
     def _send_once(self, marks, key, text, chat_id=None):
         """Отметка, отправка, при сбое - снять отметку, чтобы следующий такт повторил."""
@@ -151,6 +162,19 @@ class Reports:
                       and self._state(rows) != "published")
         if ждут:
             текст += "\n⏳ Опоздали и ждут свободного окна: %s" % ", ".join(ждут)
+        # В58: запас на пустой день тает - владелец узнает заранее, а не в пустой день
+        if self.reserve is not None:
+            try:
+                # 🔴 ревью 03.10: считается так же, как берет такт - с файлом и подписью
+                готово = sum(1 for r in self.reserve.read()
+                             if str(r.get("Статус") or "").strip().lower() == RESERVE_READY
+                             and str(r.get("Файл") or "").strip()
+                             and str(r.get("Подпись") or "").strip())
+                if готово < 2:
+                    текст += ("\n🛟 В запасе осталось %d - пополните лист ЗАПАС, "
+                              "иначе пустой день закрыть нечем" % готово)
+            except Exception as e:
+                текст += "\n🛟 Лист ЗАПАС не прочитался: %s" % http.mask(str(e))[:80]
         return текст
 
     def reminders(self):
