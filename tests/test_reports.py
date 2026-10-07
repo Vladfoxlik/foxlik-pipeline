@@ -184,6 +184,23 @@ def selftest():
     s = [t for t in owner_texts(rep) if u"Завтра" in t]
     assert s and u"W38-01" not in s[0], s
 
+    # --- 9а. 🔴 07.10: и отмененные. Ксения ушла, ее несданные строки 14-15.10
+    # переведены в ОТМЕНЕН - бот не должен напоминать ушедшему человеку,
+    # а сводка и итог недели не должны звать их «не сдан» ---
+    с_отменой = [plan_row("W41-03", "2026-10-14", status="ОТМЕНЕН"),
+                 plan_row("W41-08", "2026-10-14")]
+    накануне = datetime.datetime(2026, 10, 13, 12, 2, tzinfo=MSK)
+    rep = make(накануне, с_отменой)
+    rep.run()
+    г = group_texts(rep)
+    assert г and u"W41-08" in г[0] and u"W41-03" not in г[0], \
+        u"отмененная строка в напоминании: %s" % г
+    rep = make(накануне, с_отменой)
+    assert u"W41-03" not in rep.evening(), rep.evening()
+    воскресенье = datetime.datetime(2026, 10, 18, 10, 4, tzinfo=MSK)
+    rep = make(воскресенье, с_отменой)
+    assert u"W41-03" not in rep.week(), rep.week()
+
     # --- 10. В58: готовых в запасе меньше двух -> предупреждение в сводке 20:00 ---
     вечер = datetime.datetime(2026, 10, 3, 20, 5, tzinfo=MSK)
     rep = make(вечер, [plan_row("W40-11", "2026-10-04")])

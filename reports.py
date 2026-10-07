@@ -113,7 +113,9 @@ class Reports:
         for r in self.plan.read():
             pid = str(r.get("ID") or "").strip()
             день = dates.as_date(r.get("Дата в эфир"))
-            if not pid or not день or "ЧЕРНОВИК" in _status(r):
+            # 🔴 07.10: и ОТМЕНЕН - форма отсекала его с 11.09, а отчеты нет:
+            # ушедшей Ксении шло бы напоминание о снятых с плана строках
+            if not pid or not день or "ЧЕРНОВИК" in _status(r) or "ОТМЕНЕН" in _status(r):
                 continue
             план[pid] = (день, str(r.get("Креатор") or "").strip())
         сдачи = {}
