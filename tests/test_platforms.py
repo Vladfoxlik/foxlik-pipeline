@@ -211,8 +211,10 @@ def selftest():
     ig = P.details(АККАУНТЫ[1:2], ТЕКСТ, артикул="43287163", file_ids=[7],
                    rules=с_инстой, ozon="646406042", товар="световой стол",
                    hashtags=теги)[0]
-    assert ig["content"] == ТЕКСТ + (u"\n\n🛒 Заказывайте со скидкой на сайте FOXLIK.RU"
-                                     u"\nили на WB, артикул 43287163"), ig["content"]
+    # 🔴 21.10 владелец: призыв и скидку убрать, «оставляем сайт и где купить, ведем на сайт».
+    # 72-ФЗ: призыв купить, скидка и маркетплейс в посте Instagram - признаки рекламы.
+    assert ig["content"] == ТЕКСТ + u"\n\n🛒 Где купить: сайт FOXLIK.RU", ig["content"]
+    assert u"WB" not in ig["content"] and u"скидк" not in ig["content"], ig["content"]
     assert ig.get("instagram_share_to_feed") is True, u"поля площадки на месте"
     тт2 = P.details(тикток_акк, ТЕКСТ, артикул="43287163", file_ids=[7],
                     rules=с_инстой, товар="световой стол", hashtags=теги)[0]["content"]
